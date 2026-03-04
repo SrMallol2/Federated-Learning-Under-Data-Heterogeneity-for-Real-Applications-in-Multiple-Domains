@@ -6,7 +6,7 @@ Summary of topics for the TFG
 
 (Content coming soon...)
 
-## Knowledge distribution
+## Knowledge distribution - Generative
 
 You train a bunch of **teachers** on real data, on the **client end**.
 These teachers are locally trained models that give good predictions.
