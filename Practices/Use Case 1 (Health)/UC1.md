@@ -11,3 +11,6 @@ For the centralized model i am also currently using the sklearn MLPClassifier, a
 The problem with this model is the low interpretability it has as for health related models, the models must have high interpretability as it is needed to understand the reasoning of the model to make sure the used criteria makes sense in a medical way.
 
 Also I need to switch to Torch, as sklearn library was just for testing
+
+4/3/26
+
