@@ -27,3 +27,6 @@ checkpoints/
 
 # Data
 data/
+Practices/Use Case 1 (Health)/Federated/federated_data
+Practices/Use Case 1 (Health)/diabetes_data/diabetic_data.csv
+Practices/Use Case 1 (Health)/diabetes_data/IDS_mapping.csv

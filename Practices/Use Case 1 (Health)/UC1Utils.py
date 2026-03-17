@@ -1,25 +1,20 @@
 """
-fl_utils.py
-Practices / Use Case 1 (Health) / fl_utils.py
- 
-Shared constants and preprocessing functions for:
-  - Centralized/01_UC1_Centralized.ipynb  →  import via sys.path.append('..')
-  - Federated/02_UC1_Federated.ipynb      →  import via sys.path.append('..')
- 
-The code here is a verbatim copy of the centralized notebook's definitions.
-Nothing has been changed — this file just gives both notebooks a single source
-of truth so there is no duplication.
- 
-Extra helpers added at the bottom (derive_global_columns, split_data,
-scale_data) are only used by the federated notebook and are invisible to
-the centralized one.
+Here everything related to data loading, cleaning, and feature engineering 
+for the diabetes readmission dataset lives. 
+The same functions are used by both the centralized and federated notebooks, 
+with some additional federated-specific helpers at the bottom.
+
+This stored here and not in the notebooks to avoid cluttering the main 
+workflow (Createing a FL model and compare it with the centralized version) 
+with long data processing code.
 """
 
 import numpy as np
 import pandas as pd
 from sklearn.model_selection import GroupShuffleSplit
 from sklearn.preprocessing import StandardScaler
-
+import os
+import zipfile
 
 COLS_TO_DROP = ['weight', 'max_glu_serum', 'A1Cresult', 
                 'medical_specialty', 'payer_code', 
@@ -31,6 +26,19 @@ ADMISSION_TYPE_MAP = {
     1: 'emergency', 2: 'urgent',   3: 'elective',
     4: 'newborn',   5: 'unknown',  6: 'unknown',
     7: 'emergency', 8: 'unknown'
+}
+
+DISCHARGE_DISPOSITION_MAP = {
+    11: 'expired', 19: 'expired', 20: 'expired', 21: 'expired',
+    1: 'home', 6: 'home', 8: 'home',
+    2: 'transfer', 3: 'transfer', 4: 'transfer', 5: 'transfer',
+    10: 'transfer', 15: 'transfer', 16: 'transfer', 22: 'transfer',
+    23: 'transfer', 24: 'transfer', 27: 'transfer', 28: 'transfer',
+    29: 'transfer', 30: 'transfer',
+    13: 'hospice', 14: 'hospice',
+    7: 'ama',
+    9: 'inpatient', 12: 'inpatient',
+    18: 'unknown', 25: 'unknown', 26: 'unknown',
 }
 
 ADMISSION_SOURCE_MAP = {
@@ -64,6 +72,29 @@ MED_COLS = [
 
 MED_MAP = {'No': 0, 'Steady': 1, 'Up': 2, 'Down': 3}
 
+DATA_DIR   = "../diabetes_data"                          
+CSV_MAIN   = os.path.join(DATA_DIR, "diabetic_data.csv")
+CSV_IDS    = os.path.join(DATA_DIR, "IDS_mapping.csv")
+ZIP_FILE   = os.path.join(DATA_DIR, "diabetes.zip")   # adjust name to match your zip
+
+def ensure_data():
+    csvs_present = os.path.exists(CSV_MAIN) and os.path.exists(CSV_IDS)
+
+    if csvs_present:
+        print("✓ CSV files already present, skipping extraction.")
+        return
+
+    if os.path.exists(ZIP_FILE):
+        print(f"Extracting {ZIP_FILE} …")
+        with zipfile.ZipFile(ZIP_FILE, "r") as zf:
+            zf.extractall(DATA_DIR)
+        print("✓ Extraction complete.")
+    else:
+        raise FileNotFoundError(
+            f"Neither the CSV files nor '{ZIP_FILE}' were found in '{DATA_DIR}'.\n"
+            "Please add the zip file to the repo or place the CSVs manually."
+        )
+
 
 def load_data(path: str) -> pd.DataFrame:
     """Load raw CSV and replace ? with NaN."""
@@ -90,16 +121,9 @@ def create_target(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def group_discharge(x):
-    if x in [11, 19, 20, 21]:          return 'expired'
-    elif x in [1, 6, 8]:               return 'home'
-    elif x in [2, 3, 4, 5, 10, 15, 16,
-            22, 23, 24, 27, 28,
-            29, 30]:                return 'transfer'
-    elif x in [13, 14]:                return 'hospice'
-    elif x == 7:                       return 'ama'
-    elif x in [9, 12]:                 return 'inpatient'  # still admitted
-    elif x in [18, 25, 26]:            return 'unknown'
-    else:                              return 'other'
+    if pd.isna(x):
+        return 'unknown'
+    return DISCHARGE_DISPOSITION_MAP.get(x, 'other')
 
 
 def group_icd9(code):
@@ -187,8 +211,6 @@ def prepare_data(path: str, verbose: bool = True) -> tuple:
     y = df['readmitted_binary'].values
 
     return X, y, groups, feature_names
-
-X, y, groups, feature_names_list = prepare_data('../diabetes_data/diabetic_data.csv')
 
 
 
