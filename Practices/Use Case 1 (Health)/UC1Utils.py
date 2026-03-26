@@ -16,9 +16,7 @@ from sklearn.preprocessing import StandardScaler
 import os
 import zipfile
 
-COLS_TO_DROP = ['weight', 'max_glu_serum', 'A1Cresult', 
-                'medical_specialty', 'payer_code', 
-                'encounter_id']
+COLS_TO_DROP = ['weight', 'payer_code', 'encounter_id']
 
 DECEASED_IDS = [11, 13, 14, 19, 20, 21]
 
@@ -70,7 +68,19 @@ MED_COLS = [
     'metformin-rosiglitazone', 'metformin-pioglitazone'
 ]
 
-MED_MAP = {'No': 0, 'Steady': 1, 'Up': 2, 'Down': 3}
+# Binary: No/Steady → 0 (unchanged), Up/Down → 1 (actively changed).
+# Direction of change is not retained — both indicate active medication
+# management, which is the signal for readmission prediction.
+MED_MAP = {'No': 0, 'Steady': 0, 'Up': 1, 'Down': 1}
+
+# Near-zero-variance medications identified as non-informative
+# by Sazdov et al. (2023). Dropped after binary encoding.
+LOW_INFO_MEDS = [
+    'acetohexamide', 'tolbutamide', 'troglitazone', 'tolazamide',
+    'examide', 'citoglipton', 'glipizide-metformin',
+    'glimepiride-pioglitazone', 'metformin-rosiglitazone',
+    'metformin-pioglitazone'
+]
 
 DATA_DIR   = "../diabetes_data"                          
 CSV_MAIN   = os.path.join(DATA_DIR, "diabetic_data.csv")
@@ -148,48 +158,171 @@ def group_icd9(code):
 
 
 def encode_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Apply all encoding and grouping."""
-    # Ordinal
+    """Apply all encoding, grouping, and feature engineering.
+
+    Order of operations is load-bearing:
+      1. Ordinal encoding.
+      2. Engineered aggregate features — must use raw numeric columns before
+         any transformation touches them.
+      3. Clinical groupings + ICD-9 mapping — must run before the
+         HbA1c x diabetes interaction, which requires diag_1 to already
+         be mapped to the string 'diabetes' by group_icd9.
+      4. Medication binary encoding, medication_count, LOW_INFO_MEDS drop.
+      5. Interaction feature — after ICD-9 grouping and A1Cresult imputed.
+      6. Binary flags.
+      7. One-hot encoding — after all engineered columns exist.
+    """
+
+    # ── 1. Ordinal encoding ───────────────────────────────────────────────────
+    # Age is grouped into 10-year intervals in the raw data ([0-10), etc.).
+    # Mapped to integers 0-9 for model input. Strack et al. (2014), Table 1.
     df['age'] = df['age'].map(AGE_MAP)
 
-    # Clinical groupings
-    df['admission_type_id'] = df['admission_type_id'].map(ADMISSION_TYPE_MAP).fillna('unknown')
-    df['admission_source_id']     = df['admission_source_id'].map(ADMISSION_SOURCE_MAP).fillna('unknown')
+    # ── 2. Engineered aggregate features ─────────────────────────────────────
+    # service_utilization: sum of inpatient, outpatient, and emergency visits
+    # in the 12 months preceding this encounter. Each source column already
+    # encodes a trailing yearly window, so this is computed per row with no
+    # chronological ordering needed. High-importance feature per Sazdov et al.
+    # (2023) and Jauhari et al. (2021).
+    df['service_utilization'] = (
+        df['number_inpatient'] +
+        df['number_outpatient'] +
+        df['number_emergency']
+    )
+
+    # ── 3. Clinical groupings ─────────────────────────────────────────────────
+    # Admission type, source, and discharge disposition are integer-coded with
+    # 9, 21, and 29 distinct values respectively. Grouped into clinically
+    # meaningful categories to reduce cardinality. Strack et al. (2014), Table 1.
+    df['admission_type_id']        = df['admission_type_id'].map(ADMISSION_TYPE_MAP).fillna('unknown')
+    df['admission_source_id']      = df['admission_source_id'].map(ADMISSION_SOURCE_MAP).fillna('unknown')
     df['discharge_disposition_id'] = df['discharge_disposition_id'].apply(group_discharge)
 
-    # ICD-9 diagnosis codes
+    # ICD-9 primary and secondary diagnoses grouped into 8 clinically
+    # meaningful categories following Strack et al. (2014), Table 2.
+    # NaN values return 'other' inside group_icd9 — no prior fillna needed.
     for col in ['diag_1', 'diag_2', 'diag_3']:
         df[col] = df[col].apply(group_icd9)
 
-    # Medication columns
+    # ── 4. Medication binary encoding ─────────────────────────────────────────
+    # No/Steady -> 0 (medication unchanged), Up/Down -> 1 (actively adjusted).
+    # Direction of change is not retained — both indicate active medication
+    # management during the encounter, which is the readmission signal.
     for col in MED_COLS:
         if col in df.columns:
             df[col] = df[col].map(MED_MAP)
 
+    # medication_count: number of medications actively changed this encounter.
+    # Computed BEFORE dropping LOW_INFO_MEDS so the count reflects all 23 drugs,
+    # not just the informative subset. High-importance feature per Sazdov et al.
+    # (2023) and Goudjerkan & Jayabalan (2019).
+    active_meds = [c for c in MED_COLS if c in df.columns]
+    df['medication_count'] = df[active_meds].sum(axis=1)
+
+    # Drop near-zero-variance medications. These 10 drugs appear in fewer than
+    # 0.1% of encounters with a dosage change — after binary encoding they are
+    # near-constant columns that add noise without predictive value.
+    # Identified by Sazdov et al. (2023), Section IV-C.
+    df.drop(columns=[c for c in LOW_INFO_MEDS if c in df.columns], inplace=True)
+
+    # ── 5. Interaction feature ────────────────────────────────────────────────
+    # HbA1c x diabetes interaction: binary flag for encounters where HbA1c was
+    # measured AND the primary diagnosis is diabetes mellitus. Strack et al.
+    # (2014) show this is the strongest interaction in their logistic regression
+    # model (p < 0.001, Table 5). Placed here — AFTER group_icd9 has mapped
+    # diag_1 to the string 'diabetes', and after A1Cresult has been imputed to
+    # 'none' in prepare_data so the != 'none' check is valid.
+    df['HbA1c_diabetes_interaction'] = (
+        (df['A1Cresult'] != 'none') &
+        (df['diag_1']    == 'diabetes')
+    ).astype(int)
+
+    # ── 6. Binary flags ───────────────────────────────────────────────────────
     df['change']      = (df['change'] == 'Ch').astype(int)
     df['diabetesMed'] = (df['diabetesMed'] == 'Yes').astype(int)
 
-    # One-hot encode categoricals
+    # ── 7. One-hot encoding ───────────────────────────────────────────────────
+    # A1Cresult / max_glu_serum: in the raw CSV '?' encodes that the test was
+    # not ordered, replaced with 'none' in prepare_data. Strack et al. (2014)
+    # show that simply ordering the HbA1c test is associated with lower
+    # readmission rates regardless of the result — the 'none' category is a
+    # clinically meaningful signal, not missingness, and must be retained.
+    #
+    # medical_specialty: 53% missing in the raw data (Strack et al. 2014,
+    # Table 1). Imputed as 'Unknown' and rare specialties (< 1% of encounters,
+    # ~970 rows) grouped into 'Other_specialty' in prepare_data. This reduces
+    # the original 84 raw categories to ~10 meaningful dummy columns and avoids
+    # near-zero-variance columns from infrequent specialties. The 'Unknown'
+    # category (48.1% of encounters) is itself significant in Strack et al.
+    # (2014), Table 4: coefficient 0.463, p = 0.002.
     df = pd.get_dummies(df, columns=[
         'diag_1', 'diag_2', 'diag_3',
         'admission_type_id', 'admission_source_id',
-        'discharge_disposition_id', 'race', 'gender'
+        'discharge_disposition_id',
+        'race', 'gender',
+        'A1Cresult', 'max_glu_serum',
+        'medical_specialty',
     ])
 
     return df
 
 
+def _impute_and_group_specialty(df: pd.DataFrame) -> pd.DataFrame:
+    """Shared imputation logic for medical_specialty used by both prepare
+    functions. Extracted to avoid duplication.
+
+    Steps:
+      1. Impute NaN as 'Unknown' — 53% missing, Strack et al. (2014) Table 1.
+      2. Group rare specialties (< 1% of encounters) into 'Other_specialty'
+         to avoid near-zero-variance dummy columns after OHE.
+    """
+    df['medical_specialty'] = df['medical_specialty'].fillna('Unknown')
+    threshold = 0.01 * len(df)
+    counts    = df['medical_specialty'].value_counts()
+    rare      = counts[counts < threshold].index
+    df['medical_specialty'] = df['medical_specialty'].where(
+        ~df['medical_specialty'].isin(rare), other='Other_specialty'
+    )
+    return df
+
+
 def prepare_data(path: str, verbose: bool = True) -> tuple:
+    """Load, clean, impute, and encode the full dataset.
+
+    Returns X, y, groups, feature_names as numpy arrays.
+    groups is patient_nbr, used for patient-level train/test splits to
+    prevent data leakage across encounters of the same patient.
+    """
     df = load_data(path)
     df = drop_columns(df)
     df = remove_deceased(df)
     df = create_target(df)
 
-    # Impute race — affects ~2% of rows
+    # ── Imputation — all columns must be filled before dropna ────────────────
+    # race: 2% missing (Strack et al. 2014, Table 1). Imputed as 'Unknown'
+    # which becomes its own OHE dummy — the missingness pattern may itself
+    # carry signal about documentation quality.
     df['race'] = df['race'].fillna('Unknown')
-    # diag NaN handled inside group_icd9 (returns 'other') — no fillna needed
 
-    # Fix #4: log rows dropped by dropna so silent data loss is visible
+    # medical_specialty: 53% missing. Imputed and rare categories grouped.
+    # See _impute_and_group_specialty for full rationale.
+    df = _impute_and_group_specialty(df)
+
+    # A1Cresult / max_glu_serum: '?' in the raw CSV means the test was not
+    # ordered, replaced by load_data with NaN. Filled with 'none' to match
+    # the existing valid category value used when the test was not performed.
+    # These are NOT missing values — 'none' is the clinical state.
+    # Strack et al. (2014): HbA1c tested in only 18.4% of encounters.
+    df['A1Cresult']    = df['A1Cresult'].fillna('none')
+    df['max_glu_serum'] = df['max_glu_serum'].fillna('none')
+
+    # diag columns: NaN handled inside group_icd9 (returns 'other').
+    # No fillna needed — dropna would remove these rows unnecessarily.
+
+    # ── Drop remaining NaN rows ───────────────────────────────────────────────
+    # After the imputation above, the only remaining NaN values come from
+    # unmapped admission_type_id / admission_source_id integer codes not
+    # present in the mapping dictionaries (~1.5% of rows).
     before = len(df)
     df.dropna(inplace=True)
     dropped = before - len(df)
@@ -200,37 +333,40 @@ def prepare_data(path: str, verbose: bool = True) -> tuple:
     df = encode_features(df)
 
     if verbose:
+        n_pos = df['readmitted_binary'].sum()
+        n_neg = len(df) - n_pos
         print(f"Dataset shape after cleaning: {df.shape}")
         print(f"Class distribution:\n{df['readmitted_binary'].value_counts()}")
+        print(f"Imbalance ratio: {n_neg/n_pos:.2f}:1  "
+              f"(positive rate: {n_pos/len(df)*100:.2f}%)")
 
-    # Fix #3: capture feature names here before converting to numpy
     feature_names = df.drop(columns=['readmitted_binary', 'patient_nbr']).columns.tolist()
-
-    groups = df['patient_nbr'].values
-    X = df.drop(columns=['readmitted_binary', 'patient_nbr']).values
-    y = df['readmitted_binary'].values
+    groups        = df['patient_nbr'].values
+    X             = df.drop(columns=['readmitted_binary', 'patient_nbr']).values
+    y             = df['readmitted_binary'].values
 
     return X, y, groups, feature_names
 
 
-
 # ── Federated-only helpers ────────────────────────────────────────────────────
 # Not used by the centralized notebook. Added here to avoid a second utils file.
- 
+
 def prepare_data_aligned(path: str, global_columns: list, verbose: bool = True) -> tuple:
-    """
-    Same as prepare_data but aligns the encoded DataFrame to a pre-defined
-    column schema. Required for federated clients: each client runs get_dummies
-    independently on its own data slice, which may be missing rare dummy columns
-    (e.g. a client with no 'newborn' admissions). Without alignment the feature
-    dimensions would differ across clients, making model aggregation impossible.
- 
+    """Same pipeline as prepare_data but aligns the encoded DataFrame to a
+    pre-defined column schema.
+
+    Required for federated clients: each client runs get_dummies independently
+    on its own data slice, which may be missing rare dummy columns (e.g. a
+    client with no 'newborn' admissions or no 'Cardiology' specialty). Without
+    alignment the feature dimensions would differ across clients, making model
+    aggregation impossible.
+
     Parameters
     ----------
     path           : path to a client's raw_data.csv
     global_columns : feature name list from derive_global_columns()
     verbose        : print progress info
- 
+
     Returns
     -------
     X, y, groups, feature_names  — same signature as prepare_data()
@@ -239,35 +375,41 @@ def prepare_data_aligned(path: str, global_columns: list, verbose: bool = True) 
     df = drop_columns(df)
     df = remove_deceased(df)
     df = create_target(df)
- 
-    df['race'] = df['race'].fillna('Unknown')
- 
+
+    # Same imputation as prepare_data — must be identical or client feature
+    # spaces will diverge from the global schema.
+    df['race']         = df['race'].fillna('Unknown')
+    df               = _impute_and_group_specialty(df)
+    df['A1Cresult']    = df['A1Cresult'].fillna('none')
+    df['max_glu_serum'] = df['max_glu_serum'].fillna('none')
+
     before = len(df)
     df.dropna(inplace=True)
     dropped = before - len(df)
     if verbose and dropped > 0:
         print(f"dropna removed {dropped} rows ({dropped/before*100:.2f}%)")
- 
+
     df = encode_features(df)
- 
-    # Add any columns present in the global schema but absent in this client's
+
+    # Add columns present in the global schema but absent in this client's
     # data (rare categories not seen locally), filled with 0.
     for col in global_columns:
         if col not in df.columns:
             df[col] = 0
- 
-    # Drop any extra columns and enforce global column order.
+
+    # Drop any extra columns produced locally but absent from the global schema,
+    # and enforce the canonical global column order.
     meta = [c for c in ['patient_nbr', 'readmitted_binary'] if c in df.columns]
     df   = df[meta + global_columns]
- 
+
     if verbose:
         print(f"Dataset shape after cleaning: {df.shape}")
         print(f"Class distribution:\n{df['readmitted_binary'].value_counts()}")
- 
+
     groups = df['patient_nbr'].values
     X      = df[global_columns].values.astype(np.float32)
     y      = df['readmitted_binary'].values.astype(np.int64)
- 
+
     return X, y, groups, global_columns
  
  
