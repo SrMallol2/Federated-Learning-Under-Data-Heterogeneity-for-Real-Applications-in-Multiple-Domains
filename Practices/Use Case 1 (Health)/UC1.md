@@ -50,7 +50,17 @@ I am not sure what to do about medical speciality. In Strack's paper it is prove
 
 I think i will only keep the most significant medical specialities
 
-Talking about FL. I think 
+Talking about FL. I already liked the topic of discussing the accuracy vs comunication costs, and maybe i can prove that by given dirichlet distributions, the fed avg, performs worse that the k gen for any alpha, that is to discuss three things, accuracy, communication and heterogeny of clients. With this i can work on a good thesis.
+
+For the FedAvg, it is mostly finnished. Is just under SOTA, but i do not know exactly why as i have copied or even added some extra features.
+
+The main problem is how i deal with the issues relating to the gen in health. But i believe that if i create vectors I could study the biases they produce under the health constraints. I start implement the fed gen from the paper "Data-Free Knowledge Distillation for Heterogeneous Federated Learnnig by Zhu". Once this is completed i will do a back up and make an analysis regarding the MB of data vs the hetereogenic of data vs the performance of the model for the 3 main cases (Central, FedAvg, FedGen). I believe that my thesis should prove that FedGen is better than FedAvg on the frontier. We will see.
+
+31/3/26
+
+In order to proceed with fedgen i should study more the distribution of the data. This is something I should have done to begin wiht but here we are
+
+Alright. Although there are some things that i do not like, there is some restrictions i can add to the vectors of the generators in order to force them to make them more similar to the real ones.
 
 
 
