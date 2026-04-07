@@ -27,10 +27,12 @@ checkpoints/
 
 # Data
 data/
-Practices/Use Case 1 (Health)/Federated/federated_data
+Practices/Use Case 1 (Health)/02_FedAvg/federated_data
 Practices/Use Case 1 (Health)/diabetes_data/diabetic_data.csv
 Practices/Use Case 1 (Health)/diabetes_data/IDS_mapping.csv
-Practices/Use Case 1 (Health)/DataAnalysis/figures/
-Practices/Use Case 1 (Health)/FedGen/prototypes_class0.npy
-Practices/Use Case 1 (Health)/FedGen/prototypes_class1.npy
-Practices/Use Case 1 (Health)/FedGen/figures/
+Practices/Use Case 1 (Health)/00_DataAnalysis/figures/
+Practices/Use Case 1 (Health)/03_FedGen/prototypes_class0.npy
+Practices/Use Case 1 (Health)/03_FedGen/prototypes_class1.npy
+Practices/Use Case 1 (Health)/03_FedGen/figures/
+Practices/Use Case 1 (Health)/03_FedGen/federated_data/
+Practices/Use Case 1 (Health)/02_FedAvg/federated_data/

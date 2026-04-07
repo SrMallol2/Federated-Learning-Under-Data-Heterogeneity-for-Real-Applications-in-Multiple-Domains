@@ -62,6 +62,8 @@ In order to proceed with fedgen i should study more the distribution of the data
 
 Alright. Although there are some things that i do not like, there is some restrictions i can add to the vectors of the generators in order to force them to make them more similar to the real ones.
 
+I think i am laking some measurements of compararissons. Both FedAvg and FedGen are already done, and i should start to compare them. I should add more statisticall measurements.
+
 
 
 
