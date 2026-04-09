@@ -64,6 +64,25 @@ Alright. Although there are some things that i do not like, there is some restri
 
 I think i am laking some measurements of compararissons. Both FedAvg and FedGen are already done, and i should start to compare them. I should add more statisticall measurements.
 
+8/4/26
+
+The regularization of the generator is not working as expected. I've encountered that the latent space does not produce a nucleoid, but rather an inverted parabola. This produces a median on the empty part of it. Meaning that the generated output does not comply with an actual patient.
+
+I have different ways of fixing this or to directly do not do it. I've considered the medioid, i'll test it. Also Zhou's paper already has a regularization, but is purely statisticall in order to avoid the generator to converging. 
+
+Also i am struggling with the measurement of MB. Something does not add up.
+
+Surprised by the results of the partial models.
+
+
+Okey i am still working on this, this is a big mess. 
+
+To beggin with the noise creation, in zhu's implementation there is a contradiction, it states that the noise comes from Gaussian, but the actual implementation is a Uniform.
+
+I believe that it is best to keep the current Gaussian, as it avoids the bias from Uniform, it is centered at 0.
+
+Secondly I have found some things that do not match between models.
+
 
 
 

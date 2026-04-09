@@ -34,5 +34,4 @@ Practices/Use Case 1 (Health)/00_DataAnalysis/figures/
 Practices/Use Case 1 (Health)/03_FedGen/prototypes_class0.npy
 Practices/Use Case 1 (Health)/03_FedGen/prototypes_class1.npy
 Practices/Use Case 1 (Health)/03_FedGen/figures/
-Practices/Use Case 1 (Health)/03_FedGen/federated_data/
-Practices/Use Case 1 (Health)/02_FedAvg/federated_data/
+Practices/Use Case 1 (Health)/federated_data/
