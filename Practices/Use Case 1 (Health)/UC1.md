@@ -83,6 +83,11 @@ I believe that it is best to keep the current Gaussian, as it avoids the bias fr
 
 Secondly I have found some things that do not match between models.
 
+10/4/26
+
+Nice, the problem with the models accuracy comes from the minimum requirement partiton. In order to train the models, since the amount of data is limmited, I added a condtition where there was a need for a mininum amount of dataset. This has taken me an absourd amount of time, and i should have known that that would affect the final distribution. The main problem comes that if i add the condition, the partition is redone until i found one where that condition is match, and that results in a partition of high homogenity, regardless of the alpha.
+
+Now i need to discuss wheter to keep that condition or to do it fully random by alpha (knowing fully well that will affect the model performance)
 
 
 
