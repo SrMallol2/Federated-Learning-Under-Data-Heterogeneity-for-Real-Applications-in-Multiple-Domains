@@ -157,7 +157,7 @@ def group_icd9(code):
     else:                             return 'other'
 
 
-def encode_features(df: pd.DataFrame) -> pd.DataFrame:
+def encode_features(df: pd.DataFrame, ohe: bool=True) -> pd.DataFrame:
     """Apply all encoding, grouping, and feature engineering.
 
     Order of operations is load-bearing:
@@ -255,14 +255,15 @@ def encode_features(df: pd.DataFrame) -> pd.DataFrame:
     # near-zero-variance columns from infrequent specialties. The 'Unknown'
     # category (48.1% of encounters) is itself significant in Strack et al.
     # (2014), Table 4: coefficient 0.463, p = 0.002.
-    df = pd.get_dummies(df, columns=[
-        'diag_1', 'diag_2', 'diag_3',
-        'admission_type_id', 'admission_source_id',
-        'discharge_disposition_id',
-        'race', 'gender',
-        'A1Cresult', 'max_glu_serum',
-        'medical_specialty',
-    ])
+    if ohe:
+        df = pd.get_dummies(df, columns=[
+            'diag_1', 'diag_2', 'diag_3',
+            'admission_type_id', 'admission_source_id',
+            'discharge_disposition_id',
+            'race', 'gender',
+            'A1Cresult', 'max_glu_serum',
+            'medical_specialty',
+        ])
 
     return df
 
@@ -411,7 +412,24 @@ def prepare_data_aligned(path: str, global_columns: list, verbose: bool = True) 
     y      = df['readmitted_binary'].values.astype(np.int64)
 
     return X, y, groups, global_columns
- 
+
+
+def prepare_data_preohe(path: str) -> pd.DataFrame:
+    """
+    Same pipeline as prepare_data up to but not including OHE.
+    Returns the engineered pre-OHE DataFrame for clinical visualization.
+    """
+    df = load_data(path)
+    df = drop_columns(df)
+    df = remove_deceased(df)
+    df = create_target(df)
+    df['race']         = df['race'].fillna('Unknown')
+    df                 = _impute_and_group_specialty(df)
+    df['A1Cresult']    = df['A1Cresult'].fillna('none')
+    df['max_glu_serum'] = df['max_glu_serum'].fillna('none')
+    df.dropna(inplace=True)
+    df = encode_features(df, ohe=False)  # engineered columns only, no get_dummies
+    return df
  
 def derive_global_columns(data_path: str) -> list:
     """

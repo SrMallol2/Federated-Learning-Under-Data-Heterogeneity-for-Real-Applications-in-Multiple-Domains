@@ -39,6 +39,7 @@ Latent space (003):
 """
 
 import os
+import json
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -677,6 +678,202 @@ def plot_heterogeneity_summary(het_df, label='filtered', save_dir='figures'):
     print(f'\nHeterogeneity summary [{label}]:')
     print(het_df.to_string(index=False))
 
+def _gini(values):
+    v = np.sort(np.array(values, dtype=float))
+    n = len(v)
+    if v.sum() == 0:
+        return 0.0
+    return (2 * np.sum(np.arange(1, n + 1) * v) / (n * v.sum())) - (n + 1) / n
+ 
+ 
+def compute_gini_df(partitions, patient_labels_map, source_label):
+    """
+    Compute per-client Gini records for one partition set.
+ 
+    Parameters
+    ----------
+    partitions        : dict {alpha: {client_id: [patient_ids]}}
+    patient_labels_map: dict {patient_nbr: 0|1}
+    source_label      : string label e.g. 'filtered' or 'unfiltered'
+ 
+    Returns
+    -------
+    gini_df     : pd.DataFrame — per client per alpha
+    gini_summary: pd.DataFrame — per alpha (one Gini value per alpha)
+    """
+    records = []
+    for alpha, partition in partitions.items():
+        pos_rates, pos_counts, sizes = [], [], []
+        for client_id, patient_ids in partition.items():
+            pid_set = set(patient_ids)
+            n_pos   = sum(patient_labels_map.get(p, 0) for p in pid_set)
+            n_total = len(patient_ids)
+            pos_rates.append(n_pos / n_total if n_total > 0 else 0)
+            pos_counts.append(n_pos)
+            sizes.append(n_total)
+ 
+        gini_label = _gini(pos_rates)
+        gini_size  = _gini(sizes)
+ 
+        for k, (pr, pc, sz) in enumerate(zip(pos_rates, pos_counts, sizes)):
+            records.append({
+                'source'        : source_label,
+                'alpha'         : alpha,
+                'client'        : f'C{k}',
+                'pos_rate'      : pr,
+                'pos_count'     : pc,
+                'size'          : sz,
+                'gini_label'    : gini_label,
+                'gini_size'     : gini_size,
+                'passes_filter' : pc >= 200 and sz >= 500,
+            })
+ 
+    gini_df = pd.DataFrame(records)
+    gini_summary = (gini_df.groupby(['source', 'alpha'])
+                    [['gini_label', 'gini_size']].first()
+                    .reset_index())
+    return gini_df, gini_summary
+ 
+ 
+def plot_gini_per_client_bars(filtered_gini_df, unfiltered_gini_df,
+                               alpha_sweep, global_pos_rate,
+                               n_clients=5, save_dir='figures'):
+    """
+    Two-row grid: top = unfiltered, bottom = filtered.
+    Each panel shows per-client positive rate bars, Gini annotated in title.
+    Hatched bars = clients that fail the min_pos_abs filter.
+    """
+    COLORS = ['#4878CF', '#E24A33', '#6ACC65', '#D65F5F', '#B47CC7']
+    from matplotlib.patches import Patch
+ 
+    fig, axes = plt.subplots(2, len(alpha_sweep),
+                             figsize=(5 * len(alpha_sweep), 7),
+                             sharey='row')
+    if len(alpha_sweep) == 1:
+        axes = axes.reshape(2, 1)
+ 
+    fig.suptitle('Per-client positive rate: unfiltered vs filtered\n'
+                 'Gini annotated per panel — higher = more unequal label distribution',
+                 fontweight='bold', fontsize=11)
+ 
+    for col, alpha in enumerate(alpha_sweep):
+        for row, (df, label) in enumerate([
+            (unfiltered_gini_df, 'unfiltered'),
+            (filtered_gini_df,   'filtered'),
+        ]):
+            ax  = axes[row][col]
+            sub = df[df['alpha'] == alpha].sort_values('client')
+            if sub.empty:
+                ax.set_visible(False)
+                continue
+ 
+            for _, r in sub.iterrows():
+                k     = int(r['client'][1])
+                color = COLORS[k % len(COLORS)]
+                bar   = ax.bar(r['client'], r['pos_rate'],
+                               color=color, alpha=0.85, edgecolor='white')
+                if label == 'unfiltered' and not r['passes_filter']:
+                    bar[0].set_hatch('///')
+                    bar[0].set_edgecolor('black')
+                    bar[0].set_linewidth(0.8)
+                ax.text(r['client'], r['pos_rate'] + 0.003,
+                        f"{r['pos_rate']:.3f}", ha='center', fontsize=7)
+ 
+            ax.axhline(global_pos_rate, color='black', linestyle='--',
+                       linewidth=1.2, label='Global rate')
+            gini_val = sub['gini_label'].iloc[0]
+            ax.set_title(f'α={alpha}  [{label}]\nGini={gini_val:.3f}',
+                         fontweight='bold', fontsize=9)
+            ax.set_ylabel('Positive rate' if col == 0 else '')
+            ax.set_xlabel('Client')
+            ax.set_ylim(0, sub['pos_rate'].max() * 1.35)
+            ax.legend(fontsize=7, frameon=False)
+            ax.grid(alpha=0.2, axis='y')
+ 
+    hatch_patch = Patch(facecolor='white', edgecolor='black', hatch='///',
+                        label='Fails min_pos_abs≥200')
+    fig.legend(handles=[hatch_patch], loc='lower center',
+               fontsize=9, frameon=False, bbox_to_anchor=(0.5, -0.02))
+    plt.tight_layout()
+    _save(os.path.join(save_dir, 'gini_per_client_bars.png'))
+    plt.show()
+ 
+ 
+def plot_gini_lines(filtered_gini_summary, unfiltered_gini_summary,
+                    alpha_sweep, save_dir='figures'):
+    """
+    Two-panel line plot: Gini(label) and Gini(size) vs alpha.
+    Two lines per panel: filtered vs unfiltered.
+    Same style as W₁ and entropy comparison plots.
+    """
+    filt = filtered_gini_summary.set_index('alpha')
+    unf  = unfiltered_gini_summary.set_index('alpha')
+ 
+    fig, axes = plt.subplots(1, 2, figsize=(13, 4.5))
+    fig.suptitle('Gini heterogeneity: filtered vs unfiltered partition\n'
+                 'Gini=0: equal distribution  |  Gini=1: one client has everything',
+                 fontweight='bold', fontsize=11)
+ 
+    for ax, metric, ylabel, title in zip(
+        axes,
+        ['gini_label', 'gini_size'],
+        ['Gini (positive rate across clients)',
+         'Gini (dataset size across clients)'],
+        ['Label heterogeneity',
+         'Quantity heterogeneity'],
+    ):
+        ax.plot(unf.index, unf[metric], 'o-', color='steelblue',
+                linewidth=2, markersize=8, label='Unfiltered')
+        ax.plot(filt.index, filt[metric], 's--', color='#E24A33',
+                linewidth=2, markersize=8, label='Filtered (actual experiment)')
+ 
+        for alpha_val, val in unf[metric].items():
+            ax.annotate(f'G={val:.3f}', xy=(alpha_val, val),
+                        xytext=(6, 6), textcoords='offset points',
+                        fontsize=8, color='steelblue')
+        for alpha_val, val in filt[metric].items():
+            ax.annotate(f'G={val:.3f}', xy=(alpha_val, val),
+                        xytext=(6, -14), textcoords='offset points',
+                        fontsize=8, color='#E24A33')
+ 
+        most_unf  = unf[metric].idxmax()
+        most_filt = filt[metric].idxmax()
+        ax.annotate('Most unequal\n(unfiltered)',
+                    xy=(most_unf, unf[metric][most_unf]),
+                    xytext=(-70, 20), textcoords='offset points',
+                    fontsize=8, color='steelblue',
+                    arrowprops=dict(arrowstyle='->', color='steelblue', lw=1.2))
+        ax.annotate('Most unequal\n(filtered)',
+                    xy=(most_filt, filt[metric][most_filt]),
+                    xytext=(-70, -35), textcoords='offset points',
+                    fontsize=8, color='#E24A33',
+                    arrowprops=dict(arrowstyle='->', color='#E24A33', lw=1.2))
+ 
+        ax.set_xlabel('Dirichlet α  (generation parameter)')
+        ax.set_ylabel(ylabel)
+        ax.set_title(title, fontweight='bold', fontsize=9)
+        ax.invert_xaxis()
+        ax.legend(fontsize=9, frameon=False)
+        ax.grid(alpha=0.2)
+        ax.set_ylim(0, 1.05)
+ 
+    plt.tight_layout()
+    _save(os.path.join(save_dir, 'gini_lines_comparison.png'))
+    plt.show()
+ 
+    # Print table
+    print(f'\n{"α":<6} {"Source":<22} {"Gini label":>12} {"Gini size":>10}')
+    print('-' * 54)
+    for alpha in alpha_sweep:
+        for label, summary in [('unfiltered', unfiltered_gini_summary),
+                                ('filtered',   filtered_gini_summary)]:
+            row = summary[summary['alpha'] == alpha]
+            if len(row):
+                print(f'{alpha:<6} {label:<22} '
+                      f'{row["gini_label"].values[0]:>12.4f} '
+                      f'{row["gini_size"].values[0]:>10.4f}')
+        print()    
+
 
 # ═════════════════════════════════════════════════════════════════════════════
 # LATENT SPACE  (003_UC1_LatentSpace)
@@ -779,6 +976,428 @@ def plot_latent_prototypes(Z, y, pca, prototypes, palette=None,
     print(f'\nMean intra-class variance: class0={intra_var_0:.3f}, '
           f'class1={intra_var_1:.3f}')
     print(f'Suggested λ starting point: ~0.1 (ablate over [0.0, 0.01, 0.1, 1.0])')
+
+
+def compute_medoid(Z, y):
+    """
+    Find the medoid for each class — the actual data point whose latent
+    vector is closest (L2) to the class centroid.
+ 
+    Unlike the centroid (arithmetic mean), the medoid is always a real
+    patient encounter. For curved or shell-shaped distributions the centroid
+    can fall in an empty region; the medoid never does.
+ 
+    Returns
+    -------
+    medoids : dict {0: array(latent_dim,), 1: array(latent_dim,)}
+    medoid_indices : dict {0: int, 1: int}  — row index into Z
+    """
+    medoids         = {}
+    medoid_indices  = {}
+    for cls in [0, 1]:
+        mask     = y == cls
+        Z_cls    = Z[mask]
+        centroid = Z_cls.mean(axis=0)
+        dists    = np.linalg.norm(Z_cls - centroid, axis=1)
+        local_idx = dists.argmin()
+        global_idx = np.where(mask)[0][local_idx]
+        medoids[cls]        = Z[global_idx]
+        medoid_indices[cls] = int(global_idx)
+    return medoids, medoid_indices
+ 
+ 
+def plot_latent_prototypes_and_medoids(Z, y, pca, prototypes, medoids,
+                                        palette=None, Z_pca=None,
+                                        idx_sub=None, seed=42,
+                                        save_dir='figures'):
+    """
+    Scatter of latent points (subsampled) with both centroids (stars)
+    and medoids (diamonds) overlaid.
+ 
+    Centroid = arithmetic mean — what the constraint actually uses.
+    Medoid   = closest real data point to centroid — shows whether
+               the constraint anchor sits in a populated region.
+    """
+    colors = list((palette or PALETTE).values())
+    names  = list((palette or PALETTE).keys())
+ 
+    if Z_pca is None:
+        Z_pca = pca.transform(Z)
+    if idx_sub is None:
+        idx_sub = np.random.default_rng(seed).choice(
+            len(Z), size=min(8000, len(Z)), replace=False)
+    Z_sub = Z_pca[idx_sub]
+    y_sub = y[idx_sub]
+ 
+    fig, ax = plt.subplots(figsize=(8, 6))
+    # Background scatter
+    for label_val, (name, color) in zip([0, 1], (palette or PALETTE).items()):
+        mask = y_sub == label_val
+        ax.scatter(Z_sub[mask, 0], Z_sub[mask, 1],
+                   c=color, alpha=0.15, s=5, rasterized=True, label=name)
+ 
+    # Centroid (star) and medoid (diamond) for each class
+    for cls, color in zip([0, 1], colors):
+        # Centroid
+        proto_pca = pca.transform(prototypes[cls].reshape(1, -1))[0]
+        ax.scatter(*proto_pca[:2], c=color, s=180, marker='*',
+                   edgecolors='black', linewidth=1.2, zorder=6,
+                   label=f'Class {cls} centroid z̄_y (constraint anchor)')
+ 
+        # Medoid
+        med_pca = pca.transform(medoids[cls].reshape(1, -1))[0]
+        ax.scatter(*med_pca[:2], c=color, s=140, marker='D',
+                   edgecolors='black', linewidth=1.2, zorder=6, alpha=0.9,
+                   label=f'Class {cls} medoid (closest real patient)')
+ 
+        # Line connecting centroid to medoid
+        ax.plot([proto_pca[0], med_pca[0]],
+                [proto_pca[1], med_pca[1]],
+                color=color, linewidth=1.0, linestyle=':', alpha=0.7, zorder=5)
+ 
+        # Distance annotation
+        dist = np.linalg.norm(prototypes[cls] - medoids[cls])
+        mid  = [(proto_pca[0] + med_pca[0]) / 2,
+                (proto_pca[1] + med_pca[1]) / 2]
+        ax.annotate(f'd={dist:.2f}', xy=mid, fontsize=7,
+                    color=color, ha='center',
+                    bbox=dict(boxstyle='round,pad=0.2', fc='white', alpha=0.7))
+ 
+    ax.set_xlabel(f'PC1 ({pca.explained_variance_ratio_[0]*100:.1f}%)')
+    ax.set_ylabel(f'PC2 ({pca.explained_variance_ratio_[1]*100:.1f}%)')
+    ax.set_title('Latent space: centroids (★) vs medoids (◆)\n'
+                 'Constraint uses centroid — medoid shows nearest real patient',
+                 fontweight='bold')
+    ax.legend(markerscale=1.5, fontsize=8, frameon=True,
+              loc='upper left', bbox_to_anchor=(1.01, 1))
+    plt.tight_layout()
+    _save(os.path.join(save_dir, '10_latent_prototypes_medoids.png'))
+    plt.show()
+ 
+    # Print stats
+    print('\nCentroid vs Medoid comparison:')
+    print(f'  {"Class":<8} {"Centroid norm":>14} {"Medoid norm":>12} '
+          f'{"Distance":>10} {"In populated region?":>22}')
+    print('-' * 72)
+    for cls in [0, 1]:
+        c_norm = np.linalg.norm(prototypes[cls])
+        m_norm = np.linalg.norm(medoids[cls])
+        dist   = np.linalg.norm(prototypes[cls] - medoids[cls])
+        Z_cls  = Z[y == cls]
+        # Check: is the centroid within 1 std of the medoid?
+        intra_std = Z_cls.std(axis=0).mean()
+        populated = 'Yes' if dist < intra_std else 'No — centroid in empty region'
+        print(f'  {cls:<8} {c_norm:>14.3f} {m_norm:>12.3f} '
+              f'{dist:>10.3f} {populated:>22}')    
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# RESULTS  (04_Results)
+# ═════════════════════════════════════════════════════════════════════════════
+ 
+VARIANTS_DEFAULT = {
+    'fedavg_full':    {'label': 'FedAvg (full)',    'color': '#1f77b4', 'ls': '-',  'marker': 'o'},
+    'fedavg_partial': {'label': 'FedAvg (partial)', 'color': '#7fbfdf', 'ls': '--', 'marker': 's'},
+    'fedgen_full':    {'label': 'FedGen (full)',     'color': '#d62728', 'ls': '-',  'marker': 'o'},
+    'fedgen_partial': {'label': 'FedGen (partial)',  'color': '#ff7f0e', 'ls': '--', 'marker': 's'},
+}
+ 
+ 
+def load_results(fedavg_dir, fedgen_dir, alpha_sweep, seeds,
+                 variants=None, data_case='filtered'):
+    """
+    Load all result JSON files for one data case (filtered or unfiltered).
+ 
+    Parameters
+    ----------
+    fedavg_dir : base results dir for FedAvg, e.g. '../02_FedAvg/results'
+    fedgen_dir : base results dir for FedGen, e.g. '../03_FedGen/results'
+    alpha_sweep : list of alpha values
+    seeds       : list of seeds
+    variants    : dict of variant configs (defaults to VARIANTS_DEFAULT)
+    data_case   : 'filtered' or 'unfiltered'
+ 
+    Returns
+    -------
+    dict {alpha: {variant: {'test_aucs', 'per_client', 'histories', 'cumul_mbs'}}}
+    """
+    variants = variants or VARIANTS_DEFAULT
+    data = {}
+    missing = []
+ 
+    for alpha in alpha_sweep:
+        data[alpha] = {}
+        for vname in variants:
+            base = fedgen_dir if vname.startswith('fedgen') else fedavg_dir
+            aucs, per_client, histories, mbs = [], [], [], []
+            for seed in seeds:
+                p = os.path.join(base, data_case,
+                                 f'alpha_{alpha}', f'seed_{seed}', f'{vname}.json')
+                if os.path.exists(p):
+                    r = json.load(open(p))
+                    aucs.append(r['test_auc'])
+                    per_client.append(r['per_client'])
+                    histories.append(r['history'])
+                    mbs.append(r['cumul_mb'])
+                else:
+                    missing.append(p)
+            data[alpha][vname] = {
+                'test_aucs' : aucs,
+                'per_client': per_client,
+                'histories' : histories,
+                'cumul_mbs' : mbs,
+            }
+ 
+    if missing:
+        print(f'\n[{data_case}] Missing {len(missing)} result file(s):')
+        for p in missing:
+            print(f'  {p}')
+    else:
+        total = len(alpha_sweep) * len(variants) * len(seeds)
+        print(f'[{data_case}] All {total} result files loaded successfully.')
+ 
+    return data
+ 
+ 
+def print_results_table(results, alpha_sweep, variants=None, data_case='filtered'):
+    """
+    Print a formatted summary table: AUC, std, client equity, rounds, MB.
+    """
+    import pandas as pd
+    variants = variants or VARIANTS_DEFAULT
+ 
+    rows = []
+    for alpha in alpha_sweep:
+        for vname, vinfo in variants.items():
+            d    = results[alpha][vname]
+            aucs = d['test_aucs']
+            if not aucs:
+                continue
+            all_pc = []
+            for pc in d['per_client']:
+                all_pc.extend(list(pc.values()))
+            rows.append({
+                'Case'     : data_case,
+                'α'        : alpha,
+                'Variant'  : vinfo['label'],
+                'Mean AUC' : round(np.mean(aucs),       4),
+                'Std AUC'  : round(np.std(aucs),        4),
+                'Client σ' : round(np.std(all_pc),      4),
+                'Rounds'   : round(np.mean([len(h) for h in d['histories']]), 1),
+                'Final MB' : round(np.mean([m[-1] for m in d['cumul_mbs']]), 2),
+            })
+ 
+    df = pd.DataFrame(rows)
+    print(f'\n── Results summary [{data_case}] ──')
+    print(df.to_string(index=False))
+    return df
+ 
+ 
+def plot_convergence(results, alpha_sweep, centralized_auc,
+                     variants=None, data_case='filtered',
+                     marker_every=5, save_dir='figures'):
+    """
+    Figure 1: Test AUC vs Communication Round, one panel per alpha.
+    Shaded band = ±1 std across seeds.
+    """
+    variants = variants or VARIANTS_DEFAULT
+    fig, axes = plt.subplots(1, len(alpha_sweep),
+                             figsize=(5.5 * len(alpha_sweep), 4.2),
+                             sharey=True)
+    if len(alpha_sweep) == 1:
+        axes = [axes]
+    fig.suptitle(f'Convergence: Test AUC per Round [{data_case}]',
+                 fontweight='bold', fontsize=13)
+ 
+    for ax, alpha in zip(axes, alpha_sweep):
+        ax.axhline(centralized_auc, color='#555555', linestyle=':',
+                   linewidth=1.5, label='Centralised', zorder=1)
+        for vname, vinfo in variants.items():
+            d = results[alpha][vname]
+            if not d['histories']:
+                continue
+            max_len = max(len(h) for h in d['histories'])
+            padded  = [h + [h[-1]] * (max_len - len(h)) for h in d['histories']]
+            vals    = np.array([[s['test'] for s in h] for h in padded])
+            mean, std = vals.mean(0), vals.std(0)
+            rounds = np.arange(1, max_len + 1)
+            ax.fill_between(rounds, mean - std, mean + std,
+                            color=vinfo['color'], alpha=0.12, zorder=2)
+            ax.plot(rounds, mean, color=vinfo['color'], ls=vinfo['ls'],
+                    linewidth=2, marker=vinfo['marker'],
+                    markevery=marker_every, markersize=5,
+                    label=vinfo['label'], zorder=3)
+ 
+        ax.set_title(f'α = {alpha}', fontweight='bold')
+        ax.set_xlabel('Round')
+        ax.tick_params(labelsize=9)
+        ax.grid(alpha=0.2, zorder=0)
+        import matplotlib.ticker as mticker
+        ax.yaxis.set_major_formatter(mticker.FormatStrFormatter('%.3f'))
+ 
+    axes[0].set_ylabel('Test AUC')
+    handles, labels = axes[0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc='lower center',
+               ncol=len(variants) + 1, fontsize=9, frameon=False,
+               bbox_to_anchor=(0.5, -0.06))
+    plt.tight_layout()
+    _save(os.path.join(save_dir, f'fig1_convergence_{data_case}.png'))
+    plt.show()
+ 
+ 
+def plot_pareto(results, alpha_sweep, centralized_auc,
+                variants=None, data_case='filtered', save_dir='figures'):
+    """
+    Figure 2: Pareto frontier — Test AUC vs Cumulative MB.
+    Endpoint star marks final operating point.
+    """
+    variants = variants or VARIANTS_DEFAULT
+    import matplotlib.ticker as mticker
+ 
+    fig, axes = plt.subplots(1, len(alpha_sweep),
+                             figsize=(5.5 * len(alpha_sweep), 4.5),
+                             sharey=True)
+    if len(alpha_sweep) == 1:
+        axes = [axes]
+    fig.suptitle(f'Pareto Frontier: Test AUC vs Communication Cost [{data_case}]',
+                 fontweight='bold', fontsize=13)
+ 
+    for ax, alpha in zip(axes, alpha_sweep):
+        ax.axhline(centralized_auc, color='#555555', linestyle=':',
+                   linewidth=1.5, label='Centralised', zorder=1)
+        for vname, vinfo in variants.items():
+            d = results[alpha][vname]
+            if not d['histories']:
+                continue
+            common = min(min(len(h) for h in d['histories']),
+                         min(len(m) for m in d['cumul_mbs']))
+            padded_h  = [h + [h[-1]]  * (common - len(h))  for h in d['histories']]
+            padded_mb = [m + [m[-1]]  * (common - len(m))  for m in d['cumul_mbs']]
+            vals = np.array([[s['test'] for s in h[:common]] for h in padded_h])
+            mbs  = np.array([m[:common] for m in padded_mb])
+            mean_v, std_v = vals.mean(0), vals.std(0)
+            mean_mb = mbs.mean(0)
+ 
+            ax.fill_between(mean_mb, mean_v - std_v, mean_v + std_v,
+                            color=vinfo['color'], alpha=0.12, zorder=2)
+            ax.plot(mean_mb, mean_v, color=vinfo['color'], ls=vinfo['ls'],
+                    linewidth=2, label=vinfo['label'], zorder=3)
+            ax.scatter(mean_mb[-1], mean_v[-1], color=vinfo['color'],
+                       marker='*', s=140, edgecolors='black',
+                       linewidth=0.6, zorder=5)
+ 
+        ax.set_title(f'α = {alpha}', fontweight='bold')
+        ax.set_xlabel('Cumulative MB')
+        ax.tick_params(labelsize=9)
+        ax.grid(alpha=0.2, zorder=0)
+        ax.yaxis.set_major_formatter(mticker.FormatStrFormatter('%.3f'))
+ 
+    axes[0].set_ylabel('Test AUC')
+    handles, labels = axes[0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc='lower center',
+               ncol=len(variants) + 1, fontsize=9, frameon=False,
+               bbox_to_anchor=(0.5, -0.06))
+    plt.tight_layout()
+    _save(os.path.join(save_dir, f'fig2_pareto_{data_case}.png'))
+    plt.show()
+ 
+ 
+def plot_equity(results, alpha_sweep, centralized_auc,
+                variants=None, data_case='filtered', save_dir='figures'):
+    """
+    Figure 3: Per-client AUC distribution — grouped bars with jittered dots.
+    Shows equity across clients (intra-variant spread) and across seeds.
+    """
+    import matplotlib.ticker as mticker
+    variants = variants or VARIANTS_DEFAULT
+ 
+    fig, axes = plt.subplots(1, len(alpha_sweep),
+                             figsize=(5.5 * len(alpha_sweep), 4.5),
+                             sharey=True)
+    if len(alpha_sweep) == 1:
+        axes = [axes]
+    fig.suptitle(f'Per-Client AUC — Equity Across Clients [{data_case}]',
+                 fontweight='bold', fontsize=13)
+ 
+    x_pos = np.arange(len(variants))
+ 
+    for ax, alpha in zip(axes, alpha_sweep):
+        for j, (vname, vinfo) in enumerate(variants.items()):
+            d = results[alpha][vname]
+            all_aucs = []
+            for pc in d['per_client']:
+                all_aucs.extend(list(pc.values()))
+            if not all_aucs:
+                continue
+            mean_auc = np.mean(all_aucs)
+            std_auc  = np.std(all_aucs)
+            ax.bar(x_pos[j], mean_auc, 0.6,
+                   color=vinfo['color'], alpha=0.75,
+                   edgecolor='white', linewidth=0.8, zorder=2)
+            ax.errorbar(x_pos[j], mean_auc, yerr=std_auc,
+                        fmt='none', color='black', capsize=4,
+                        linewidth=1.5, zorder=3)
+            rng    = np.random.default_rng(42)
+            jitter = rng.uniform(-0.18, 0.18, len(all_aucs))
+            ax.scatter(x_pos[j] + jitter, all_aucs,
+                       color='black', s=12, alpha=0.5, zorder=4)
+ 
+        ax.axhline(centralized_auc, color='#555555', linestyle=':',
+                   linewidth=1.5, label='Centralised', zorder=1)
+        ax.set_title(f'α = {alpha}', fontweight='bold')
+        ax.set_xticks(x_pos)
+        ax.set_xticklabels([v['label'] for v in variants.values()],
+                           rotation=25, ha='right', fontsize=8)
+        ax.tick_params(axis='y', labelsize=9)
+        ax.grid(alpha=0.2, axis='y', zorder=0)
+        ax.yaxis.set_major_formatter(mticker.FormatStrFormatter('%.3f'))
+ 
+    axes[0].set_ylabel('Per-Client Test AUC')
+    plt.tight_layout()
+    _save(os.path.join(save_dir, f'fig3_equity_{data_case}.png'))
+    plt.show()
+ 
+ 
+def plot_auc_vs_alpha(results, alpha_sweep, centralized_auc,
+                      variants=None, data_case='filtered', save_dir='figures'):
+    """
+    Figure 4: Final test AUC vs heterogeneity level α.
+    X-axis inverted: left = most heterogeneous, matching Zhu et al. Fig 5.
+    """
+    import matplotlib.ticker as mticker
+    variants = variants or VARIANTS_DEFAULT
+ 
+    fig, ax = plt.subplots(figsize=(7, 4.5))
+    fig.suptitle(f'Final Test AUC vs Dirichlet α [{data_case}]',
+                 fontweight='bold', fontsize=13)
+ 
+    ax.axhline(centralized_auc, color='#555555', linestyle=':',
+               linewidth=1.5, label='Centralised', zorder=1)
+ 
+    for vname, vinfo in variants.items():
+        means, stds = [], []
+        for alpha in alpha_sweep:
+            aucs = results[alpha][vname]['test_aucs']
+            means.append(np.mean(aucs) if aucs else np.nan)
+            stds.append(np.std(aucs)   if aucs else 0.0)
+        ax.errorbar(alpha_sweep, means, yerr=stds,
+                    color=vinfo['color'], ls=vinfo['ls'],
+                    linewidth=2, marker=vinfo['marker'], markersize=8,
+                    capsize=5, capthick=1.5,
+                    label=vinfo['label'], zorder=3)
+ 
+    ax.set_xlabel('Dirichlet α   (lower = more heterogeneous)', fontsize=10)
+    ax.set_ylabel('Test AUC')
+    ax.set_xticks(alpha_sweep)
+    ax.set_xticklabels([f'α={a}' for a in alpha_sweep])
+    ax.invert_xaxis()
+    ax.legend(fontsize=9, frameon=False)
+    ax.grid(alpha=0.2, zorder=0)
+    ax.yaxis.set_major_formatter(mticker.FormatStrFormatter('%.3f'))
+ 
+    plt.tight_layout()
+    _save(os.path.join(save_dir, f'fig4_auc_vs_alpha_{data_case}.png'))
+    plt.show()    
 
 
 # ═════════════════════════════════════════════════════════════════════════════
