@@ -90,5 +90,11 @@ Nice, the problem with the models accuracy comes from the minimum requirement pa
 Now i need to discuss wheter to keep that condition or to do it fully random by alpha (knowing fully well that will affect the model performance)
 
 
+17/4/26
 
+Okey, rn i am testing lots of different models, both from partial and full models. Partial models have the advantatge of only sharing the final prediction layer, which makes it more secure and with les MBs. The full models on the other hand tend to perform better
+
+21/4/26 
+
+Mostly everything is done for UC1, just need to organize everything and it is almost done
 

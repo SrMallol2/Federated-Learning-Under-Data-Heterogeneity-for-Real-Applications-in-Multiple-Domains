@@ -44,12 +44,15 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
+import matplotlib.ticker as mticker
 from scipy.stats import wasserstein_distance, ks_2samp
 from scipy.spatial.distance import jensenshannon
 from scipy.stats import entropy as scipy_entropy
 
 PALETTE = {'Not readmitted (0)': '#4878CF', 'Readmitted <30d (1)': '#E24A33'}
 _C0, _C1 = list(PALETTE.values())
+CENTRALIZED_AUC = 0.658
+
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -1101,7 +1104,25 @@ VARIANTS_DEFAULT = {
     'fedgen_full':    {'label': 'FedGen (full)',     'color': '#d62728', 'ls': '-',  'marker': 'o'},
     'fedgen_partial': {'label': 'FedGen (partial)',  'color': '#ff7f0e', 'ls': '--', 'marker': 's'},
 }
- 
+VARIANTS_PARTIAL = {
+    'fedavg_partial':        {'label': 'FedAvg (partial)',         'color': '#d62728', 'ls': '-',  'marker': 'o'},
+    'fedgen_partial':        {'label': 'FedGen (partial)(centroid)',         'color': '#ff7f0e', 'ls': '--', 'marker': 's'},
+    'fedgen_partial_medoid': {'label': 'FedGen partial (medoid)', 'color': '#2ca02c', 'ls': '--', 'marker': 's'},
+    'fedgen_zhu':            {'label': 'FedGen-Zhu (KL)(centroid)',         'color': '#e377c2', 'ls': '-',  'marker': '^'},
+    'fedgen_zhu_medoid':     {'label': 'FedGen-Zhu (KL, medoid)','color': '#17becf', 'ls': '-',  'marker': '^'},
+    'fedgen_zhu_no_proto':   {'label': 'FedGen-Zhu (no proto)',   'color': '#ff7f0e', 'ls': '--', 'marker': '^'},
+    'fedgen_gmm':            {'label': 'FedGen-GMM (partial)',    'color': '#9467bd', 'ls': '--', 'marker': 'D'},
+}
+VARIANTS_FULL = {
+    'fedavg_full':            {'label': 'FedAvg (full)',            'color': '#1f77b4', 'ls': '-',  'marker': 'o'},
+    'fedgen_full':            {'label': 'FedGen (full)(centroid)',            'color': '#6baed6', 'ls': '--', 'marker': 's'},
+    'fedgen_full_medoid':     {'label': 'FedGen full (medoid)',     'color': '#2ca02c', 'ls': '-',  'marker': 's'},
+    'fedgen_zhu_full':        {'label': 'FedGen-Zhu (full)(centroid)',        'color': '#bcbd22', 'ls': '-',  'marker': 'D'},
+    'fedgen_zhu_full_medoid': {'label': 'FedGen-Zhu full (medoid)','color': '#8c564b', 'ls': '-',  'marker': '^'},
+    'fedgen_zhu_full_no_proto':{'label': 'FedGen-Zhu (full, no proto)', 'color': '#6baed6', 'ls': '--', 'marker': '^'},
+    'fedgen_gmm_full':        {'label': 'FedGen-GMM (full)',        'color': '#9467bd', 'ls': '-',  'marker': 'D'},
+} 
+VARIANTS_ALL = {**VARIANTS_PARTIAL, **VARIANTS_FULL}
  
 def load_results(fedavg_dir, fedgen_dir, alpha_sweep, seeds,
                  variants=None, data_case='filtered'):
@@ -1397,8 +1418,196 @@ def plot_auc_vs_alpha(results, alpha_sweep, centralized_auc,
  
     plt.tight_layout()
     _save(os.path.join(save_dir, f'fig4_auc_vs_alpha_{data_case}.png'))
-    plt.show()    
+    plt.show()   
 
+def _means_stds_mbs(results, alpha_sweep, vname):
+    means, stds, mbs = [], [], []
+    for a in alpha_sweep:
+        d = results[a].get(vname)
+        means.append(np.mean(d['test_aucs'])  if d and d['test_aucs'] else np.nan)
+        stds.append( np.std(d['test_aucs'])   if d and d['test_aucs'] else np.nan)
+        mbs.append(  np.mean([m[-1] for m in d['cumul_mbs']]) if d and d['cumul_mbs'] else np.nan)
+    return np.array(means), np.array(stds), np.array(mbs)
+
+def _het_label(alpha):
+    if alpha <= 0.5:  return 'HIGH'
+    if alpha <= 1.0:  return 'MID'
+    return 'LOW'     
+
+def plot_auc_vs_alpha_families(results, alpha_sweep, centralized_auc,
+                                data_case='filtered', save_dir='figures'):
+    x       = np.arange(len(alpha_sweep))
+    xlabels = [f'α={a}' for a in alpha_sweep]
+    panels = [
+        ('Partial-sharing  [P]', 'per-client local encoder + local test', VARIANTS_PARTIAL),
+        ('Full-sharing  [G]',    'global model, concatenated test',       VARIANTS_FULL),
+    ]
+    fig, axes = plt.subplots(1, 2, figsize=(16, 5.5), sharey=False)
+    fig.suptitle(f'AUC vs heterogeneity — {data_case}', fontweight='bold', fontsize=13)
+    for ax, (title, eval_note, variants) in zip(axes, panels):
+        ax.axhline(centralized_auc, color='#555', ls=':', lw=1.5, label='Centralised (ref)', zorder=1)
+        for vname, vinfo in variants.items():
+            means, stds, _ = _means_stds_mbs(results, alpha_sweep, vname)
+            if np.all(np.isnan(means)): continue
+            ax.fill_between(x, means-stds, means+stds, color=vinfo['color'], alpha=0.13, zorder=2)
+            ax.plot(x, means, color=vinfo['color'], ls=vinfo['ls'], lw=2, marker=vinfo['marker'], ms=7, label=vinfo['label'], zorder=3)
+        ax.set_title(f'{title}\n({eval_note})', fontweight='bold', fontsize=10, pad=8)
+        ax.set_xticks(x); ax.set_xticklabels(xlabels, fontsize=9)
+        ax.set_xlabel('α  (0.1 = most heterogeneous)', fontsize=9)
+        ax.set_ylabel('Mean test AUC  (±1 std)', fontsize=9)
+        ax.legend(fontsize=7.5, frameon=False); ax.grid(alpha=0.2)
+        ax.yaxis.set_major_formatter(mticker.FormatStrFormatter('%.3f'))
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, f'auc_vs_alpha_families_{data_case}.png'), bbox_inches='tight', dpi=130)
+    plt.show()
+
+
+def plot_partial_vs_full_band(results, alpha_sweep, centralized_auc,
+                               data_case='filtered', save_dir='figures'):
+    x = np.arange(len(alpha_sweep))
+    xlabels = [f'α={a}' for a in alpha_sweep]
+    fig, ax = plt.subplots(figsize=(10, 5))
+    fig.suptitle(f'Partial-sharing vs full-sharing AUC range — {data_case}\n'
+                 f'(grey band = full-sharing min–max;  partial costs < 2 MB total)',
+                 fontweight='bold', fontsize=11)
+    full_means = np.array([
+        [np.mean(results[a].get(v, {}).get('test_aucs', [np.nan])) for a in alpha_sweep]
+        for v in VARIANTS_FULL
+    ])
+    ax.fill_between(x, np.nanmin(full_means, 0), np.nanmax(full_means, 0),
+                    color='#888', alpha=0.18, label='Full-sharing range [G]', zorder=1)
+    ax.axhline(centralized_auc, color='#555', ls=':', lw=1.5, label='Centralised (ref)', zorder=1)
+    for vname, vinfo in VARIANTS_PARTIAL.items():
+        means, stds, _ = _means_stds_mbs(results, alpha_sweep, vname)
+        if np.all(np.isnan(means)): continue
+        ax.fill_between(x, means-stds, means+stds, color=vinfo['color'], alpha=0.12, zorder=2)
+        ax.plot(x, means, color=vinfo['color'], ls=vinfo['ls'], lw=2, marker=vinfo['marker'], ms=7, label=f'{vinfo["label"]} [P]', zorder=3)
+    ax.set_xticks(x); ax.set_xticklabels(xlabels)
+    ax.set_xlabel('α  (0.1 = most heterogeneous  →  10.0 = near-IID)')
+    ax.set_ylabel('Mean test AUC'); ax.grid(alpha=0.2)
+    ax.yaxis.set_major_formatter(mticker.FormatStrFormatter('%.3f'))
+    ax.legend(fontsize=9, frameon=False, loc='upper left', ncol=2)
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, f'partial_vs_full_{data_case}.png'), bbox_inches='tight')
+    plt.show()
+
+def plot_centroid_vs_medoid(results, alpha_sweep, data_case='filtered', save_dir='figures'):
+    pairs = [
+        ('fedgen_partial', 'fedgen_partial_medoid', 'Hard CE\npartial'),
+        ('fedgen_zhu',     'fedgen_zhu_medoid',     'KL ens.\npartial'),
+        ('fedgen_full',    'fedgen_full_medoid',    'Hard CE\nfull'),
+        ('fedgen_zhu_full','fedgen_zhu_full_medoid','KL ens.\nfull'),
+    ]
+    w = 0.35
+    fig, axes = plt.subplots(1, len(alpha_sweep), figsize=(4.2*len(alpha_sweep), 5), sharey=True)
+    fig.suptitle(f'Centroid vs medoid prototype anchor — {data_case}', fontweight='bold', fontsize=13)
+    for ax, alpha in zip(axes, alpha_sweep):
+        ax.axhline(CENTRALIZED_AUC, color='#555', ls=':', lw=1.2)
+        positions, tick_labels = [], []
+        pos = 0
+        for v_c, v_m, pair_label in pairs:
+            for offset, vname, color, tag in [(-w/2, v_c, '#ff7f0e', 'centroid'), (w/2, v_m, '#2ca02c', 'medoid')]:
+                d = results[alpha].get(vname)
+                if not d or not d['test_aucs']: continue
+                mean = np.mean(d['test_aucs']); std = np.std(d['test_aucs'])
+                lbl = tag if (alpha == alpha_sweep[0] and pos <= 1) else None
+                ax.bar(pos+offset, mean, w*0.88, color=color, alpha=0.82, label=lbl, zorder=2)
+                ax.errorbar(pos+offset, mean, yerr=std, fmt='none', color='black', capsize=4, lw=1.2, zorder=3)
+                ax.text(pos+offset, mean+std+0.003, f'{mean:.3f}', ha='center', fontsize=7)
+            positions.append(pos); tick_labels.append(pair_label); pos += 1
+        ax.set_title(f'α = {alpha}', fontweight='bold')
+        ax.set_xticks(positions); ax.set_xticklabels(tick_labels, fontsize=8)
+        ax.grid(alpha=0.2, axis='y'); ax.yaxis.set_major_formatter(mticker.FormatStrFormatter('%.3f'))
+    axes[0].set_ylabel('Mean test AUC  (3 seeds)'); axes[0].legend(fontsize=9, frameon=False)
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, f'centroid_vs_medoid_{data_case}.png'), bbox_inches='tight')
+    plt.show()
+
+
+def _get_client_test_sizes(alpha, data_case):
+    sizes = {}
+    for i in range(5):
+        path = os.path.join('../federated_data', data_case, f'alpha_{alpha}', f'client_{i}', 'client_info.json')
+        if os.path.exists(path):
+            with open(path) as f: sizes[str(i)] = json.load(f)['n_test']
+    return sizes
+
+def plot_equity_weighted(results, alpha_sweep, centralized_auc, data_case='filtered', save_dir='figures'):
+    vts = VARIANTS_PARTIAL
+    fig, axes = plt.subplots(2, len(alpha_sweep), figsize=(4.5*len(alpha_sweep), 9))
+    fig.suptitle(f'Per-client equity analysis — {data_case}\n(partial-sharing family only)', fontweight='bold', fontsize=12)
+    for col, alpha in enumerate(alpha_sweep):
+        sizes = _get_client_test_sizes(alpha, data_case)
+        vnames = list(vts.keys()); x_bars = np.arange(len(vnames)); width = 0.35
+        ax_top = axes[0, col]; ax_top.axhline(centralized_auc, color='#555', ls=':', lw=1.2)
+        wm_list, um_list = [], []
+        for vname in vnames:
+            d = results[alpha].get(vname)
+            if not d or not d['per_client']: wm_list.append(np.nan); um_list.append(np.nan); continue
+            aw, au = [], []
+            for pc in d['per_client']:
+                if not pc: continue
+                ws, wt, uv = 0.0, 0, []
+                for cid, auc in pc.items():
+                    n = sizes.get(str(cid), 1); ws += auc*n; wt += n; uv.append(auc)
+                if wt: aw.append(ws/wt)
+                if uv: au.append(np.mean(uv))
+            wm_list.append(np.mean(aw) if aw else np.nan); um_list.append(np.mean(au) if au else np.nan)
+        ax_top.bar(x_bars-width/2, wm_list, width, color='#1f77b4', alpha=0.8, label='Weighted mean')
+        ax_top.bar(x_bars+width/2, um_list, width, color='#ff7f0e', alpha=0.8, label='Unweighted mean')
+        ax_top.set_title(f'α = {alpha}', fontweight='bold', fontsize=9)
+        ax_top.set_xticks(x_bars)
+        ax_top.set_xticklabels([vts[v]['label'].replace(' ','\n') for v in vnames], fontsize=7, rotation=15, ha='right')
+        ax_top.yaxis.set_major_formatter(mticker.FormatStrFormatter('%.3f')); ax_top.grid(alpha=0.2, axis='y')
+        if col == 0: ax_top.set_ylabel('AUC'); ax_top.legend(fontsize=7, frameon=False)
+        ax_bot = axes[1, col]; mins, spreads = [], []
+        for vname in vnames:
+            d = results[alpha].get(vname)
+            if not d or not d['per_client']: mins.append(np.nan); spreads.append(np.nan); continue
+            am, asp = [], []
+            for pc in d['per_client']:
+                if not pc: continue
+                vals = list(pc.values()); am.append(min(vals)); asp.append(max(vals)-min(vals))
+            mins.append(np.mean(am) if am else np.nan); spreads.append(np.mean(asp) if asp else np.nan)
+        ax_bot.bar(x_bars-width/2, mins, width, color='#d62728', alpha=0.8, label='Min client AUC')
+        ax_bot.bar(x_bars+width/2, spreads, width, color='#9467bd', alpha=0.8, label='Max−Min spread')
+        ax_bot.axhline(centralized_auc, color='#555', ls=':', lw=1.2)
+        ax_bot.set_title(f'α = {alpha}', fontweight='bold', fontsize=9)
+        ax_bot.set_xticks(x_bars)
+        ax_bot.set_xticklabels([vts[v]['label'].replace(' ','\n') for v in vnames], fontsize=7, rotation=15, ha='right')
+        ax_bot.yaxis.set_major_formatter(mticker.FormatStrFormatter('%.3f')); ax_bot.grid(alpha=0.2, axis='y')
+        if col == 0: ax_bot.set_ylabel('AUC'); ax_bot.legend(fontsize=7, frameon=False)
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, f'equity_weighted_{data_case}.png'), bbox_inches='tight', dpi=130)
+    plt.show()
+
+def print_equity_table(results, alpha_sweep, data_case='filtered'):
+    vts = VARIANTS_PARTIAL; W = 26
+    print(f'\n{"="*78}\n  EQUITY TABLE — {data_case.upper()}')
+    print(f'  Weighted = large clients count more | Unweighted = each hospital equally')
+    print(f'  Gap = weighted − unweighted  (positive = large hospitals favoured)\n{"="*78}')
+    for alpha in alpha_sweep:
+        sizes = _get_client_test_sizes(alpha, data_case); het = _het_label(alpha)
+        print(f'\n  ── α = {alpha}  ({het}) ──')
+        print(f'  {"Variant":<{W}} {"Weighted":>9}  {"Unweighted":>11}  {"Gap":>6}  {"Min client":>11}  {"Spread":>8}')
+        print(f'  {"-"*(W+54)}')
+        rows = []
+        for vname, vinfo in vts.items():
+            d = results[alpha].get(vname)
+            if not d or not d['per_client']: continue
+            aw, au, am, asp = [], [], [], []
+            for pc in d['per_client']:
+                if not pc: continue
+                vals = list(pc.values())
+                ws = sum(pc[c]*sizes.get(c,1) for c in pc); wt = sum(sizes.get(c,1) for c in pc)
+                aw.append(ws/wt if wt else np.nan); au.append(np.mean(vals))
+                am.append(min(vals)); asp.append(max(vals)-min(vals))
+            if not aw: continue
+            wm = np.mean(aw); um = np.mean(au)
+            rows.append((wm, vinfo['label'], um, wm-um, np.mean(am), np.mean(asp)))
+        for wm, label, um, gap, mn, sp in sorted(rows, reverse=True):
+            flag = ' ▲' if abs(gap) > 0.01 else ''
+            print(f'  {label:<{W}} {wm:>9.4f}  {um:>11.4f}  {gap:>+6.4f}  {mn:>11.4f}  {sp:>8.4f}{flag}')
 
 # ═════════════════════════════════════════════════════════════════════════════
 # INTERNAL HELPER

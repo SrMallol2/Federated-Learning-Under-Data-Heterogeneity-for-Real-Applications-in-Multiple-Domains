@@ -13,26 +13,39 @@ Design principles
   expected to come from the notebook via fl_hyperparams.json and are passed
   as arguments to functions that need them.
 
-Exported symbols (what notebooks should import)
-------------------------------------------------
+Scope
+-----
+This module holds the shared core used by both sharing families.
+FedGen training loops live elsewhere:
+    - Partial-sharing variants  → UC1FedGenPartial.py
+    - Full-sharing    variants  → UC1FedGenFull.py
+
+Exported symbols
+----------------
 Data utilities:
-    dirichlet_partition, find_feasible_params, load_clients, verify_leakage, save_result
+    dirichlet_partition, find_feasible_params, create_clients_raw_csv,
+    preprocess_and_save_client, preprocess_clients,
+    load_clients, load_partitions_from_disk, verify_leakage, save_result
 
 Model classes:
     MLP, Generator, GMMSampler
 
 Training helpers:
-    make_criterion, fed_avg, evaluate_global
-    compute_client_distribution, _compute_local_prototypes, _aggregate_prototypes
+    model_bytes, mb, make_criterion, fed_avg, evaluate_global
 
-FedAvg:
-    local_train_fedavg_full, local_train_fedavg_partial
-    run_fedavg_full, run_fedavg_partial
+Prototype / latent-stats helpers (shared by all FedGen variants):
+    compute_client_distribution
+    _compute_local_prototypes      — centroid (arithmetic mean) anchor
+    _compute_local_medoid_proxy    — medoid (nearest real point) anchor
+    _aggregate_prototypes
 
-FedGen:
-    local_train_fedgen_partial, local_train_fedgen_full
-    update_generator, update_generator_full
-    run_fedgen_partial, run_fedgen_full
+Generator updates (server-side):
+    update_generator       — partial-sharing variant (predictor weights only)
+    update_generator_full  — full-sharing variant   (reads predictor.weight/bias)
+
+FedAvg baselines:
+    local_train_fedavg_full,    local_train_fedavg_partial
+    run_fedavg_full,            run_fedavg_partial
 
 Hyperparameter search:
     fl_objective
@@ -630,6 +643,40 @@ def _compute_local_prototypes(model, X_train, y_train, device):
     return per_class_stats
 
 
+def _compute_local_medoid_proxy(model, X_train, y_train, device):
+    """
+    Per-class medoid proxy in the client's current latent space.
+
+    For each class y, finds the training point z* = argmin_{z in Z_y} ||z - mean(Z_y)||.
+    z* is a real patient encoding — guaranteed to lie in a populated region
+    even on non-convex or horseshoe-shaped latent manifolds.
+
+    Complexity: O(n × latent_dim) — one pass, no pairwise distances.
+
+    Drop-in replacement for _compute_local_prototypes: same dict structure,
+    same 'mean', 'std', 'n' keys. 'std' is still the class covariance (used
+    by GMMSampler but not by update_generator's prototype constraint).
+    """
+    model.eval()
+    with torch.no_grad():
+        Z_all = model.encode(X_train.to(device)).cpu().numpy()
+    y_np = y_train.numpy()
+    stats = {}
+    for cls in [0, 1]:
+        mask = y_np == cls
+        if mask.sum() > 0:
+            Z_cls    = Z_all[mask]
+            centroid = Z_cls.mean(axis=0)
+            dists    = np.linalg.norm(Z_cls - centroid, axis=1)  # (n_cls,)
+            medoid   = Z_cls[np.argmin(dists)]                   # real patient encoding
+            stats[cls] = {
+                'mean': medoid,                      # ← medoid replaces centroid
+                'std':  Z_cls.std(axis=0) + 1e-8,   # class spread (unchanged)
+                'n':    int(mask.sum()),
+            }
+    return stats
+
+
 def _aggregate_prototypes(client_stats):
     """
     Weighted aggregation of per-client per-class centroids.
@@ -997,258 +1044,3 @@ def update_generator_full(generator, full_model_states, global_prototypes, devic
 
     generator.eval()
 
-
-# ═════════════════════════════════════════════════════════════════════════════
-# FEDGEN — LOCAL TRAINING
-# ═════════════════════════════════════════════════════════════════════════════
-
-def local_train_fedgen_partial(model, generator, X_train, y_train, X_val, y_val,
-                                device, batch_size=128, lr=1e-3,
-                                local_epochs=LOCAL_EPOCHS, noise_dim=NOISE_DIM):
-    loader      = DataLoader(TensorDataset(X_train, y_train),
-                             batch_size=batch_size, shuffle=True, drop_last=True)
-    criterion_r  = make_criterion(y_train.numpy(), device)
-    criterion_kd = nn.CrossEntropyLoss()
-    opt_full = torch.optim.Adam(model.parameters(),           lr=lr)
-    opt_gr   = torch.optim.Adam(model.predictor.parameters(), lr=lr)
-
-    best_val_auc  = 0.0
-    best_gr_state = {k: v.clone() for k, v in model.predictor.state_dict().items()}
-
-    for _ in range(local_epochs):
-        model.train()
-        # Fresh synthetic batch each epoch — preserves generator stochasticity
-        n_syn = min(batch_size, len(X_train))
-        with torch.no_grad():
-            y_hat = torch.randint(0, 2, (n_syn,), device=device)
-            eps   = torch.randn(n_syn, noise_dim, device=device)
-            Z_hat = generator(y_hat, eps)
-
-        for xb, yb in loader:
-            xb, yb = xb.to(device), yb.to(device)
-            model.zero_grad()
-            criterion_r(model(xb), yb).backward()
-            opt_full.step()
-            model.predictor.zero_grad()
-            criterion_kd(model.predictor(Z_hat), y_hat).backward()
-            opt_gr.step()
-
-        model.eval()
-        with torch.no_grad():
-            vp = torch.softmax(model(X_val.to(device)), dim=1)[:, 1].cpu().numpy()
-        if len(np.unique(y_val.numpy())) > 1:
-            auc = roc_auc_score(y_val.numpy(), vp)
-            if auc > best_val_auc:
-                best_val_auc  = auc
-                best_gr_state = {k: v.clone()
-                                 for k, v in model.predictor.state_dict().items()}
-
-    per_class_stats = _compute_local_prototypes(model, X_train, y_train, device)
-    return best_gr_state, len(X_train), per_class_stats
-
-
-def local_train_fedgen_full(model, generator, X_train, y_train, X_val, y_val,
-                             device, batch_size=128, lr=1e-3,
-                             local_epochs=LOCAL_EPOCHS, noise_dim=NOISE_DIM):
-    loader      = DataLoader(TensorDataset(X_train, y_train),
-                             batch_size=batch_size, shuffle=True, drop_last=True)
-    criterion_r  = make_criterion(y_train.numpy(), device)
-    criterion_kd = nn.CrossEntropyLoss()
-    opt_full = torch.optim.Adam(model.parameters(),           lr=lr)
-    opt_gr   = torch.optim.Adam(model.predictor.parameters(), lr=lr)
-
-    best_val_auc = 0.0
-    best_state   = {k: v.clone() for k, v in model.state_dict().items()}
-
-    for _ in range(local_epochs):
-        model.train()
-        n_syn = min(batch_size, len(X_train))
-        with torch.no_grad():
-            y_hat = torch.randint(0, 2, (n_syn,), device=device)
-            eps   = torch.randn(n_syn, noise_dim, device=device)
-            Z_hat = generator(y_hat, eps)
-
-        for xb, yb in loader:
-            xb, yb = xb.to(device), yb.to(device)
-            opt_full.zero_grad()
-            criterion_r(model(xb), yb).backward()
-            opt_full.step()
-            opt_gr.zero_grad()
-            criterion_kd(model.predictor(Z_hat), y_hat).backward()
-            opt_gr.step()
-
-        model.eval()
-        with torch.no_grad():
-            vp = torch.softmax(model(X_val.to(device)), dim=1)[:, 1].cpu().numpy()
-        if len(np.unique(y_val.numpy())) > 1:
-            auc = roc_auc_score(y_val.numpy(), vp)
-            if auc > best_val_auc:
-                best_val_auc = auc
-                best_state   = {k: v.clone() for k, v in model.state_dict().items()}
-
-    per_class_stats = _compute_local_prototypes(model, X_train, y_train, device)
-    return best_state, len(X_train), per_class_stats
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-# FEDGEN — RUN LOOPS
-# ═════════════════════════════════════════════════════════════════════════════
-
-def run_fedgen_partial(clients, input_dim, seed,
-                       hidden_dim, dropout, lr, batch_size,
-                       n_clients=N_CLIENTS, fl_rounds=FL_ROUNDS,
-                       local_epochs=LOCAL_EPOCHS, patience=PATIENCE,
-                       noise_dim=NOISE_DIM):
-    torch.manual_seed(seed)
-    np.random.seed(seed)
-
-    latent_dim   = hidden_dim // 4
-    global_model = MLP(input_dim, hidden_dim=hidden_dim, dropout=dropout).to(device)
-    generator_   = Generator(latent_dim, noise_dim).to(device)
-    local_models = {
-        i: MLP(input_dim, hidden_dim=hidden_dim, dropout=dropout).to(device)
-        for i in range(n_clients)
-    }
-    for i in range(n_clients):
-        local_models[i].load_state_dict(global_model.state_dict())
-
-    n_pred      = sum(p.numel() for p in global_model.predictor.parameters())
-    n_gen       = sum(p.numel() for p in generator_.parameters())
-    bytes_round = (2 * n_pred + n_gen) * 4 * n_clients
-
-    best_val_auc, best_gr_state, best_gen_state, no_improve = 0.0, None, None, 0
-    history, cumul_mb, total_bytes = [], [], 0
-
-    for fl_round in range(fl_rounds):
-        gr_states, counts, client_stats = [], [], []
-        for i in range(n_clients):
-            local_models[i].predictor.load_state_dict(
-                global_model.predictor.state_dict()
-            )
-            sd, n, stats = local_train_fedgen_partial(
-                local_models[i], generator_,
-                clients[i]['X_train'], clients[i]['y_train'],
-                clients[i]['X_val'],   clients[i]['y_val'],
-                device, batch_size=batch_size, lr=lr,
-                local_epochs=local_epochs, noise_dim=noise_dim,
-            )
-            gr_states.append(sd)
-            counts.append(n)
-            client_stats.append(stats)
-
-        global_model.predictor.load_state_dict(fed_avg(gr_states, counts))
-        global_prototypes = _aggregate_prototypes(client_stats)
-        update_generator(generator_, gr_states, global_prototypes, device,
-                         noise_dim=noise_dim)
-        total_bytes += bytes_round
-
-        global_model.eval()
-        vp, vy, tp, ty = [], [], [], []
-        with torch.no_grad():
-            for i in range(n_clients):
-                z_v = local_models[i].encode(clients[i]['X_val'].to(device))
-                z_t = local_models[i].encode(clients[i]['X_test'].to(device))
-                vp.append(torch.softmax(global_model.predictor(z_v), dim=1)[:,1].cpu().numpy())
-                vy.append(clients[i]['y_val'].numpy())
-                tp.append(torch.softmax(global_model.predictor(z_t), dim=1)[:,1].cpu().numpy())
-                ty.append(clients[i]['y_test'].numpy())
-        val_auc  = roc_auc_score(np.concatenate(vy), np.concatenate(vp))
-        test_auc = roc_auc_score(np.concatenate(ty), np.concatenate(tp))
-        history.append({'val': val_auc, 'test': test_auc})
-        cumul_mb.append(total_bytes / (1024 ** 2))
-        print(f'  [fedgen_partial] R{fl_round+1:02d}: val={val_auc:.4f} '
-              f'test={test_auc:.4f} cumul={cumul_mb[-1]:.2f}MB')
-
-        if val_auc > best_val_auc:
-            best_val_auc   = val_auc
-            best_gr_state  = {k: v.clone()
-                              for k, v in global_model.predictor.state_dict().items()}
-            best_gen_state = {k: v.clone() for k, v in generator_.state_dict().items()}
-            no_improve = 0
-        else:
-            no_improve += 1
-            if no_improve >= patience:
-                print(f'  Early stopping at round {fl_round+1}.')
-                break
-
-    global_model.predictor.load_state_dict(best_gr_state)
-    global_auc, per_client = evaluate_global(global_model, clients,
-                                             use_local_encoders=True,
-                                             local_models=local_models)
-    return global_auc, per_client, history, cumul_mb
-
-
-def run_fedgen_full(clients, input_dim, seed,
-                    hidden_dim, dropout, lr, batch_size,
-                    n_clients=N_CLIENTS, fl_rounds=FL_ROUNDS,
-                    local_epochs=LOCAL_EPOCHS, patience=PATIENCE,
-                    noise_dim=NOISE_DIM):
-    torch.manual_seed(seed)
-    np.random.seed(seed)
-
-    latent_dim   = hidden_dim // 4
-    global_model = MLP(input_dim, hidden_dim=hidden_dim, dropout=dropout).to(device)
-    generator_   = Generator(latent_dim, noise_dim).to(device)
-
-    n_full      = sum(p.numel() for p in global_model.parameters())
-    n_gen       = sum(p.numel() for p in generator_.parameters())
-    bytes_round = (2 * n_full + n_gen) * 4 * n_clients
-
-    best_val_auc, best_state, best_gen_state, no_improve = 0.0, None, None, 0
-    history, cumul_mb, total_bytes = [], [], 0
-
-    for fl_round in range(fl_rounds):
-        state_dicts, gr_states, counts, client_stats = [], [], [], []
-        for i in range(n_clients):
-            local = MLP(input_dim, hidden_dim=hidden_dim, dropout=dropout).to(device)
-            local.load_state_dict(global_model.state_dict())
-            sd, n, stats = local_train_fedgen_full(
-                local, generator_,
-                clients[i]['X_train'], clients[i]['y_train'],
-                clients[i]['X_val'],   clients[i]['y_val'],
-                device, batch_size=batch_size, lr=lr,
-                local_epochs=local_epochs, noise_dim=noise_dim,
-            )
-            state_dicts.append(sd)
-            gr_states.append({k: v.clone()
-                               for k, v in local.predictor.state_dict().items()})
-            counts.append(n)
-            client_stats.append(stats)
-
-        global_model.load_state_dict(fed_avg(state_dicts, counts))
-        global_prototypes = _aggregate_prototypes(client_stats)
-        update_generator_full(generator_, state_dicts, global_prototypes, device,
-                               noise_dim=noise_dim)
-        total_bytes += bytes_round
-
-        global_model.eval()
-        vp, vy, tp, ty = [], [], [], []
-        with torch.no_grad():
-            for i in range(n_clients):
-                vp.append(torch.softmax(global_model(clients[i]['X_val'].to(device)),
-                                        dim=1)[:,1].cpu().numpy())
-                vy.append(clients[i]['y_val'].numpy())
-                tp.append(torch.softmax(global_model(clients[i]['X_test'].to(device)),
-                                        dim=1)[:,1].cpu().numpy())
-                ty.append(clients[i]['y_test'].numpy())
-        val_auc  = roc_auc_score(np.concatenate(vy), np.concatenate(vp))
-        test_auc = roc_auc_score(np.concatenate(ty), np.concatenate(tp))
-        history.append({'val': val_auc, 'test': test_auc})
-        cumul_mb.append(total_bytes / (1024 ** 2))
-        print(f'  [fedgen_full] R{fl_round+1:02d}: val={val_auc:.4f} '
-              f'test={test_auc:.4f} cumul={cumul_mb[-1]:.2f}MB')
-
-        if val_auc > best_val_auc:
-            best_val_auc   = val_auc
-            best_state     = {k: v.clone() for k, v in global_model.state_dict().items()}
-            best_gen_state = {k: v.clone() for k, v in generator_.state_dict().items()}
-            no_improve = 0
-        else:
-            no_improve += 1
-            if no_improve >= patience:
-                print(f'  Early stopping at round {fl_round+1}.')
-                break
-
-    global_model.load_state_dict(best_state)
-    global_auc, per_client = evaluate_global(global_model, clients)
-    return global_auc, per_client, history, cumul_mb
