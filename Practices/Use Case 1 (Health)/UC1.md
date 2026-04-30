@@ -98,3 +98,13 @@ Okey, rn i am testing lots of different models, both from partial and full model
 
 Mostly everything is done for UC1, just need to organize everything and it is almost done
 
+27/4/26
+
+Alright, i am reviewing UC1, must things have to change, I forgto some theory of p(y) and some extras
+
+For UC2, the implementation is pretty straight forward, I should not worry about it.
+
+Also I should be startting to write the final thesis 1 month and a half left.
+
+
+

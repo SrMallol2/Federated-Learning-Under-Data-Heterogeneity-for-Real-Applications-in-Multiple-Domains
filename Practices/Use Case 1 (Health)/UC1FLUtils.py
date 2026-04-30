@@ -954,6 +954,95 @@ def run_fedavg_partial(clients, input_dim, seed,
 # FEDGEN — GENERATOR UPDATES
 # ═════════════════════════════════════════════════════════════════════════════
 
+
+def update_generator_pyhat(generator, gr_states, global_prototypes, device,
+                            p_hat_y, n_gen_samples=128,
+                            noise_dim=NOISE_DIM, gen_steps=GEN_STEPS,
+                            lambda_proto=LAMBDA_PROTO, gen_lr=GEN_LR):
+    """
+    Paper-faithful server-side generator update (partial sharing).
+
+    Difference vs. update_generator:
+        # Before (UC1FLUtils.py):
+        half  = 64
+        y_gen = torch.cat([torch.zeros(half, ...), torch.ones(half, ...)])
+
+        # After:
+        y_gen = torch.multinomial(p_hat_y, n_gen_samples, replacement=True)
+    """
+    all_w = [sd['weight'].to(device) for sd in gr_states]
+    all_b = [sd['bias'].to(device)   for sd in gr_states]
+
+    proto_t = {
+        cls: torch.tensor(v['mean'], dtype=torch.float32, device=device)
+        for cls, v in global_prototypes.items()
+    }
+
+    p_hat_dev = p_hat_y.to(device)
+    opt = torch.optim.Adam(generator.parameters(), lr=gen_lr)
+    generator.train()
+
+    for _ in range(gen_steps):
+        opt.zero_grad()
+        y_gen = torch.multinomial(p_hat_dev, n_gen_samples, replacement=True)
+        eps   = torch.randn(n_gen_samples, noise_dim, device=device)
+        Z_gen = generator(y_gen, eps)
+
+        probs   = torch.stack([
+            torch.softmax(Z_gen @ w.T + b, dim=1)
+            for w, b in zip(all_w, all_b)
+        ]).mean(0)
+        loss_ce = -(torch.log(probs[range(n_gen_samples), y_gen] + 1e-8)).mean()
+
+        proto_tgt = torch.stack([proto_t[int(yy.item())] for yy in y_gen])
+        loss_p    = ((Z_gen - proto_tgt) ** 2).mean()
+
+        (loss_ce + lambda_proto * loss_p).backward()
+        opt.step()
+
+    generator.eval()
+
+
+def update_generator_full_pyhat(generator, full_model_states, global_prototypes, device,
+                                 p_hat_y, n_gen_samples=128,
+                                 noise_dim=NOISE_DIM, gen_steps=GEN_STEPS,
+                                 lambda_proto=LAMBDA_PROTO, gen_lr=GEN_LR):
+    """
+    Paper-faithful server-side generator update (full sharing).
+    Same fix as update_generator_pyhat but extracts heads from full state dicts.
+    """
+    all_w = [sd['predictor.weight'].to(device) for sd in full_model_states]
+    all_b = [sd['predictor.bias'].to(device)   for sd in full_model_states]
+
+    proto_t = {
+        cls: torch.tensor(v['mean'], dtype=torch.float32, device=device)
+        for cls, v in global_prototypes.items()
+    }
+
+    p_hat_dev = p_hat_y.to(device)
+    opt = torch.optim.Adam(generator.parameters(), lr=gen_lr)
+    generator.train()
+
+    for _ in range(gen_steps):
+        opt.zero_grad()
+        y_gen = torch.multinomial(p_hat_dev, n_gen_samples, replacement=True)
+        eps   = torch.randn(n_gen_samples, noise_dim, device=device)
+        Z_gen = generator(y_gen, eps)
+
+        probs   = torch.stack([
+            torch.softmax(Z_gen @ w.T + b, dim=1)
+            for w, b in zip(all_w, all_b)
+        ]).mean(0)
+        loss_ce = -(torch.log(probs[range(n_gen_samples), y_gen] + 1e-8)).mean()
+
+        proto_tgt = torch.stack([proto_t[int(yy.item())] for yy in y_gen])
+        loss_p    = ((Z_gen - proto_tgt) ** 2).mean()
+
+        (loss_ce + lambda_proto * loss_p).backward()
+        opt.step()
+
+    generator.eval()
+
 def update_generator(generator, gr_states, global_prototypes, device,
                      noise_dim=NOISE_DIM, gen_steps=GEN_STEPS,
                      lambda_proto=LAMBDA_PROTO, gen_lr=GEN_LR):
