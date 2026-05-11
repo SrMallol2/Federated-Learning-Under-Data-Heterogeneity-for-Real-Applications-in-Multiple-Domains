@@ -1,24 +1,25 @@
 """
 UC1FedGenFull.py
 ─────────────────────────────────────────────────────────────────────────────
-Full-sharing FedGen variants.
+Full-sharing FedGen variants for UC1 (Diabetes 130-US Hospitals).
 
-Both the feature extractor and the predictor head are averaged across
-clients every round (standard FedAvg on the full model), along with the
-lightweight generator (or GMM statistics). Evaluation uses the global
-model end-to-end, no local encoders.
+Both feature extractor and predictor are averaged each round (standard
+FedAvg on the full model). Evaluation uses the global model end-to-end.
 
-Variants
---------
-    fedgen_full              — hard CE KD    + centroid anchor
-    fedgen_full_medoid       — hard CE KD    + medoid anchor
-    fedgen_zhu_full          — KL ensemble KD + centroid anchor   (Zhu Algorithm 1)
-    fedgen_zhu_full_medoid   — KL ensemble KD + medoid anchor
-    fedgen_gmm_full          — hard CE KD    + GMM sampler (no neural generator)
+Variants                                    KD loss     Label     Proto     p̂(y)
+──────────────────────────────────────────────────────────────────────────────────
+fedgen_full                                 hard CE     uniform   centroid    ✗
+fedgen_full_medoid                          hard CE     uniform   medoid      ✗
+fedgen_zhu_full                             KL ensemb.  uniform   centroid    ✗
+fedgen_zhu_full_medoid                      KL ensemb.  uniform   medoid      ✗
+fedgen_zhu_full_no_proto                    KL ensemb.  uniform   (λ=0)       ✗
+fedgen_gmm_full                             hard CE     balanced  centroid    ✗
+fedgen_zhu_pyhat_full                       KL ensemb.  p̂(y)      centroid    ✓
+fedgen_zhu_pyhat_full_medoid                KL ensemb.  p̂(y)      medoid      ✓
+fedgen_paper_full                           hard CE     p̂(y)      centroid    ✓
+fedgen_paper_full_no_proto                  hard CE     p̂(y)      (λ=0)       ✓
 
-Every variant exposes `local_train_<variant>` and `run_<variant>`. Signatures
-mirror UC1FedGenPartial.py so the notebook loop can treat partial/full pairs
-interchangeably.
+Partial-sharing counterparts live in UC1FedGenPartial.py.
 """
 
 import numpy as np
@@ -33,9 +34,10 @@ from UC1FLUtils import (
     fed_avg, make_criterion, evaluate_global,
     _compute_local_prototypes, _compute_local_medoid_proxy,
     _aggregate_prototypes, compute_client_distribution,
+    _label_counter, _aggregate_phat,
     update_generator_full,
     N_CLIENTS, FL_ROUNDS, LOCAL_EPOCHS, PATIENCE, NOISE_DIM, LAMBDA_PROTO,
-    device,
+    NUM_CLASSES, device,
 )
 
 
@@ -44,10 +46,7 @@ from UC1FLUtils import (
 # ═════════════════════════════════════════════════════════════════════════════
 
 def _eval_full(global_model, clients, n_clients):
-    """
-    Full-sharing evaluation: single global model over all clients' test data.
-    Returns (val_auc, test_auc) on concatenated patient-level scores.
-    """
+    """Single global model over all clients' data → concatenated AUC."""
     global_model.eval()
     vp, vy, tp, ty = [], [], [], []
     with torch.no_grad():
@@ -64,8 +63,10 @@ def _eval_full(global_model, clients, n_clients):
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# Local training — one function per variant
+# LOCAL TRAINING FUNCTIONS
 # ═════════════════════════════════════════════════════════════════════════════
+
+# ── hard CE KD (centroid / medoid) — KD applied inside batch loop ─────────
 
 def local_train_fedgen_full(model, generator, X_train, y_train, X_val, y_val,
                              device, batch_size=128, lr=1e-3,
@@ -113,7 +114,7 @@ def local_train_fedgen_full(model, generator, X_train, y_train, X_val, y_val,
 def local_train_fedgen_full_medoid(model, generator, X_train, y_train, X_val, y_val,
                                     device, batch_size=128, lr=1e-3,
                                     local_epochs=LOCAL_EPOCHS, noise_dim=NOISE_DIM):
-    """Identical to local_train_fedgen_full except the anchor is a medoid."""
+    """Identical to local_train_fedgen_full but uses medoid anchor."""
     loader       = DataLoader(TensorDataset(X_train, y_train),
                               batch_size=batch_size, shuffle=True, drop_last=True)
     criterion_r  = make_criterion(y_train.numpy(), device)
@@ -150,19 +151,17 @@ def local_train_fedgen_full_medoid(model, generator, X_train, y_train, X_val, y_
                 best_val_auc = auc
                 best_state   = {k: v.clone() for k, v in model.state_dict().items()}
 
-    # ← medoid anchor
     per_class_stats = _compute_local_medoid_proxy(model, X_train, y_train, device)
     return best_state, len(X_train), per_class_stats
 
+
+# ── KL ensemble KD (centroid / medoid) — KD applied once per epoch ────────
 
 def local_train_fedgen_zhu_full(model, generator, all_predictor_states,
                                  X_train, y_train, X_val, y_val,
                                  device, batch_size=128, lr=1e-3,
                                  local_epochs=LOCAL_EPOCHS, noise_dim=NOISE_DIM):
-    """
-    Full-model update with paper-faithful KL-ensemble KD loss (Zhu Algorithm 1).
-    Both feature extractor and predictor are shared and averaged each round.
-    """
+    """KL-ensemble KD, full model update.  Labels sampled uniformly."""
     loader      = DataLoader(TensorDataset(X_train, y_train),
                              batch_size=batch_size, shuffle=True, drop_last=True)
     criterion_r = make_criterion(y_train.numpy(), device)
@@ -216,7 +215,7 @@ def local_train_fedgen_zhu_full_medoid(model, generator, all_predictor_states,
                                         X_train, y_train, X_val, y_val,
                                         device, batch_size=128, lr=1e-3,
                                         local_epochs=LOCAL_EPOCHS, noise_dim=NOISE_DIM):
-    """KL-ensemble KD + medoid anchor. Differs from _zhu_full only in the proto call."""
+    """KL-ensemble KD + medoid anchor, full model update."""
     loader      = DataLoader(TensorDataset(X_train, y_train),
                              batch_size=batch_size, shuffle=True, drop_last=True)
     criterion_r = make_criterion(y_train.numpy(), device)
@@ -262,20 +261,183 @@ def local_train_fedgen_zhu_full_medoid(model, generator, all_predictor_states,
                 best_val_auc = auc
                 best_state   = {k: v.clone() for k, v in model.state_dict().items()}
 
-    # ← medoid anchor
     per_class_stats = _compute_local_medoid_proxy(model, X_train, y_train, device)
     return best_state, len(X_train), per_class_stats
 
+
+# ── KL ensemble KD + p̂(y) (centroid / medoid) ────────────────────────────
+
+def local_train_fedgen_zhu_pyhat_full(model, generator, all_predictor_states, p_hat_y,
+                                       X_train, y_train, X_val, y_val,
+                                       device, batch_size=128, lr=1e-3,
+                                       local_epochs=LOCAL_EPOCHS, noise_dim=NOISE_DIM):
+    """KL-ensemble KD with ŷ ~ p̂(y) + centroid anchor, full model.  Returns c_k."""
+    loader      = DataLoader(TensorDataset(X_train, y_train),
+                             batch_size=batch_size, shuffle=True, drop_last=True)
+    criterion_r = make_criterion(y_train.numpy(), device)
+    opt_full    = torch.optim.Adam(model.parameters(),           lr=lr)
+    opt_gr      = torch.optim.Adam(model.predictor.parameters(), lr=lr)
+
+    all_W = [sd['weight'].to(device) for sd in all_predictor_states]
+    all_b = [sd['bias'].to(device)   for sd in all_predictor_states]
+    p_hat_dev = p_hat_y.to(device)
+
+    best_val_auc = 0.0
+    best_state   = {k: v.clone() for k, v in model.state_dict().items()}
+
+    for _ in range(local_epochs):
+        model.train()
+        n_syn = min(batch_size, len(X_train))
+        with torch.no_grad():
+            y_hat = torch.multinomial(p_hat_dev, n_syn, replacement=True)
+            eps   = torch.randn(n_syn, noise_dim, device=device)
+            Z_hat = generator(y_hat, eps)
+            ensemble_probs = torch.stack([
+                torch.softmax(Z_hat @ W.T + b, dim=1)
+                for W, b in zip(all_W, all_b)
+            ]).mean(dim=0)
+
+        for xb, yb in loader:
+            xb, yb = xb.to(device), yb.to(device)
+            opt_full.zero_grad()
+            criterion_r(model(xb), yb).backward()
+            opt_full.step()
+
+        opt_gr.zero_grad()
+        log_local = F.log_softmax(model.predictor(Z_hat.detach()), dim=1)
+        loss_kd   = -(ensemble_probs.detach() * log_local).sum(dim=1).mean()
+        loss_kd.backward()
+        opt_gr.step()
+
+        model.eval()
+        with torch.no_grad():
+            vp = torch.softmax(model(X_val.to(device)), dim=1)[:, 1].cpu().numpy()
+        if len(np.unique(y_val.numpy())) > 1:
+            auc = roc_auc_score(y_val.numpy(), vp)
+            if auc > best_val_auc:
+                best_val_auc = auc
+                best_state   = {k: v.clone() for k, v in model.state_dict().items()}
+
+    per_class_stats = _compute_local_prototypes(model, X_train, y_train, device)
+    c_k = _label_counter(y_train)
+    return best_state, len(X_train), per_class_stats, c_k
+
+
+def local_train_fedgen_zhu_pyhat_full_medoid(model, generator, all_predictor_states, p_hat_y,
+                                              X_train, y_train, X_val, y_val,
+                                              device, batch_size=128, lr=1e-3,
+                                              local_epochs=LOCAL_EPOCHS, noise_dim=NOISE_DIM):
+    """KL-ensemble KD with ŷ ~ p̂(y) + medoid anchor, full model.  Returns c_k."""
+    loader      = DataLoader(TensorDataset(X_train, y_train),
+                             batch_size=batch_size, shuffle=True, drop_last=True)
+    criterion_r = make_criterion(y_train.numpy(), device)
+    opt_full    = torch.optim.Adam(model.parameters(),           lr=lr)
+    opt_gr      = torch.optim.Adam(model.predictor.parameters(), lr=lr)
+
+    all_W = [sd['weight'].to(device) for sd in all_predictor_states]
+    all_b = [sd['bias'].to(device)   for sd in all_predictor_states]
+    p_hat_dev = p_hat_y.to(device)
+
+    best_val_auc = 0.0
+    best_state   = {k: v.clone() for k, v in model.state_dict().items()}
+
+    for _ in range(local_epochs):
+        model.train()
+        n_syn = min(batch_size, len(X_train))
+        with torch.no_grad():
+            y_hat = torch.multinomial(p_hat_dev, n_syn, replacement=True)
+            eps   = torch.randn(n_syn, noise_dim, device=device)
+            Z_hat = generator(y_hat, eps)
+            ensemble_probs = torch.stack([
+                torch.softmax(Z_hat @ W.T + b, dim=1)
+                for W, b in zip(all_W, all_b)
+            ]).mean(dim=0)
+
+        for xb, yb in loader:
+            xb, yb = xb.to(device), yb.to(device)
+            opt_full.zero_grad()
+            criterion_r(model(xb), yb).backward()
+            opt_full.step()
+
+        opt_gr.zero_grad()
+        log_local = F.log_softmax(model.predictor(Z_hat.detach()), dim=1)
+        loss_kd   = -(ensemble_probs.detach() * log_local).sum(dim=1).mean()
+        loss_kd.backward()
+        opt_gr.step()
+
+        model.eval()
+        with torch.no_grad():
+            vp = torch.softmax(model(X_val.to(device)), dim=1)[:, 1].cpu().numpy()
+        if len(np.unique(y_val.numpy())) > 1:
+            auc = roc_auc_score(y_val.numpy(), vp)
+            if auc > best_val_auc:
+                best_val_auc = auc
+                best_state   = {k: v.clone() for k, v in model.state_dict().items()}
+
+    per_class_stats = _compute_local_medoid_proxy(model, X_train, y_train, device)
+    c_k = _label_counter(y_train)
+    return best_state, len(X_train), per_class_stats, c_k
+
+
+# ── Paper-faithful hard CE + p̂(y) ────────────────────────────────────────
+
+def local_train_paper_full(model, generator, p_hat_y,
+                            X_train, y_train, X_val, y_val,
+                            device, batch_size=128, lr=1e-3,
+                            local_epochs=LOCAL_EPOCHS, noise_dim=NOISE_DIM):
+    """
+    Equation 5: J(θ_k) = L̂_k(θ_k) + E_{ŷ~p̂(y), z~G(z|ŷ)} [ CE(h(z; θ^p_k), ŷ) ]
+    Hard label CE, no ensemble.  KD applied once per epoch.
+    """
+    loader       = DataLoader(TensorDataset(X_train, y_train),
+                              batch_size=batch_size, shuffle=True, drop_last=True)
+    criterion_r  = make_criterion(y_train.numpy(), device)
+    criterion_kd = nn.CrossEntropyLoss()
+    opt_full     = torch.optim.Adam(model.parameters(),           lr=lr)
+    opt_gr       = torch.optim.Adam(model.predictor.parameters(), lr=lr)
+    p_hat_dev    = p_hat_y.to(device)
+
+    best_val_auc = 0.0
+    best_state   = {k: v.clone() for k, v in model.state_dict().items()}
+
+    for _ in range(local_epochs):
+        model.train()
+        n_syn = min(batch_size, len(X_train))
+        with torch.no_grad():
+            y_hat = torch.multinomial(p_hat_dev, n_syn, replacement=True)
+            eps   = torch.randn(n_syn, noise_dim, device=device)
+            Z_hat = generator(y_hat, eps)
+
+        for xb, yb in loader:
+            xb, yb = xb.to(device), yb.to(device)
+            opt_full.zero_grad()
+            criterion_r(model(xb), yb).backward()
+            opt_full.step()
+
+        opt_gr.zero_grad()
+        criterion_kd(model.predictor(Z_hat.detach()), y_hat).backward()
+        opt_gr.step()
+
+        model.eval()
+        with torch.no_grad():
+            vp = torch.softmax(model(X_val.to(device)), dim=1)[:, 1].cpu().numpy()
+        if len(np.unique(y_val.numpy())) > 1:
+            auc = roc_auc_score(y_val.numpy(), vp)
+            if auc > best_val_auc:
+                best_val_auc = auc
+                best_state   = {k: v.clone() for k, v in model.state_dict().items()}
+
+    per_class_stats = _compute_local_prototypes(model, X_train, y_train, device)
+    c_k = _label_counter(y_train)
+    return best_state, len(X_train), per_class_stats, c_k
+
+
+# ── GMM sampler — KD inside batch loop ───────────────────────────────────
 
 def local_train_fedgen_gmm_full(model, gmm_sampler,
                                  X_train, y_train, X_val, y_val,
                                  device, batch_size=128, lr=1e-3,
                                  local_epochs=LOCAL_EPOCHS):
-    """
-    Full-model training with GMMSampler synthetic samples. No neural generator,
-    no prototype constraint — the GMM is updated server-side from client
-    latent stats each round.
-    """
     loader       = DataLoader(TensorDataset(X_train, y_train),
                               batch_size=batch_size, shuffle=True, drop_last=True)
     criterion_r  = make_criterion(y_train.numpy(), device)
@@ -310,22 +472,21 @@ def local_train_fedgen_gmm_full(model, gmm_sampler,
                 best_val_auc = auc
                 best_state   = {k: v.clone() for k, v in model.state_dict().items()}
 
-    return best_state, len(X_train)  # GMM run loop fetches stats separately
+    return best_state, len(X_train)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# Run loops
+# RUN LOOPS
 # ═════════════════════════════════════════════════════════════════════════════
 
 def _run_fedgen_full_generic(clients, input_dim, seed,
                               hidden_dim, dropout, lr, batch_size,
                               local_train_fn, use_ensemble_teacher,
                               n_clients=N_CLIENTS, fl_rounds=FL_ROUNDS,
-                              local_epochs=LOCAL_EPOCHS, patience=PATIENCE,lambda_proto=LAMBDA_PROTO,
+                              local_epochs=LOCAL_EPOCHS, patience=PATIENCE,
+                              lambda_proto=LAMBDA_PROTO,
                               noise_dim=NOISE_DIM, variant_name='fedgen_full'):
-    """
-    Unified run loop for the 4 neural-generator full variants.
-    """
+    """Unified run loop for neural-generator full variants (uniform sampling)."""
     torch.manual_seed(seed)
     np.random.seed(seed)
 
@@ -369,7 +530,6 @@ def _run_fedgen_full_generic(clients, input_dim, seed,
                     local_epochs=local_epochs, noise_dim=noise_dim,
                 )
             state_dicts.append(sd)
-            # Extract predictor slice for next-round ensemble teacher
             gr_states.append({
                 'weight': sd['predictor.weight'].clone(),
                 'bias':   sd['predictor.bias'].clone(),
@@ -382,8 +542,9 @@ def _run_fedgen_full_generic(clients, input_dim, seed,
             all_predictor_states = gr_states
 
         global_prototypes = _aggregate_prototypes(client_stats)
+        # FIX: pass lambda_proto parameter (was hardcoded to LAMBDA_PROTO before)
         update_generator_full(generator_, state_dicts, global_prototypes, device,
-                              noise_dim=noise_dim, lambda_proto=LAMBDA_PROTO)
+                              noise_dim=noise_dim, lambda_proto=lambda_proto)
         total_bytes += bytes_round
 
         val_auc, test_auc = _eval_full(global_model, clients, n_clients)
@@ -408,90 +569,202 @@ def _run_fedgen_full_generic(clients, input_dim, seed,
     return global_auc, per_client, history, cumul_mb
 
 
-def run_fedgen_full(clients, input_dim, seed,
-                    hidden_dim, dropout, lr, batch_size,
+def _run_fedgen_full_pyhat_generic(clients, input_dim, seed,
+                                    hidden_dim, dropout, lr, batch_size,
+                                    local_train_fn, use_ensemble_teacher=True,
+                                    n_clients=N_CLIENTS, fl_rounds=FL_ROUNDS,
+                                    local_epochs=LOCAL_EPOCHS, patience=PATIENCE,
+                                    lambda_proto=LAMBDA_PROTO,
+                                    noise_dim=NOISE_DIM,
+                                    variant_name='fedgen_zhu_pyhat_full'):
+    """Unified run loop for full variants with paper-faithful p̂(y) maintenance."""
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+
+    latent_dim   = hidden_dim // 4
+    global_model = MLP(input_dim, hidden_dim=hidden_dim, dropout=dropout).to(device)
+    generator_   = Generator(latent_dim, noise_dim).to(device)
+
+    n_full      = sum(p.numel() for p in global_model.parameters())
+    n_gen       = sum(p.numel() for p in generator_.parameters())
+    bytes_round = (2 * n_full + n_gen) * 4 * n_clients + NUM_CLASSES * 4 * n_clients
+
+    best_val_auc, best_state, best_gen_state, no_improve = 0.0, None, None, 0
+    history, cumul_mb, total_bytes = [], [], 0
+
+    p_hat_y = torch.full((NUM_CLASSES,), 1.0 / NUM_CLASSES)
+
+    all_predictor_states = [
+        {k: v.clone() for k, v in global_model.predictor.state_dict().items()}
+        for _ in range(n_clients)
+    ] if use_ensemble_teacher else None
+
+    for fl_round in range(fl_rounds):
+        state_dicts, gr_states, counts, client_stats, client_c = [], [], [], [], []
+
+        for i in range(n_clients):
+            local = MLP(input_dim, hidden_dim=hidden_dim, dropout=dropout).to(device)
+            local.load_state_dict(global_model.state_dict())
+
+            if use_ensemble_teacher:
+                sd, n, stats, c_k = local_train_fn(
+                    local, generator_, all_predictor_states, p_hat_y,
+                    clients[i]['X_train'], clients[i]['y_train'],
+                    clients[i]['X_val'],   clients[i]['y_val'],
+                    device, batch_size=batch_size, lr=lr,
+                    local_epochs=local_epochs, noise_dim=noise_dim,
+                )
+            else:
+                sd, n, stats, c_k = local_train_fn(
+                    local, generator_, p_hat_y,
+                    clients[i]['X_train'], clients[i]['y_train'],
+                    clients[i]['X_val'],   clients[i]['y_val'],
+                    device, batch_size=batch_size, lr=lr,
+                    local_epochs=local_epochs, noise_dim=noise_dim,
+                )
+            state_dicts.append(sd)
+            gr_states.append({
+                'weight': sd['predictor.weight'].clone(),
+                'bias':   sd['predictor.bias'].clone(),
+            })
+            counts.append(n)
+            client_stats.append(stats)
+            client_c.append(c_k)
+
+        global_model.load_state_dict(fed_avg(state_dicts, counts))
+        if use_ensemble_teacher:
+            all_predictor_states = gr_states
+        p_hat_y = _aggregate_phat(client_c)
+
+        global_prototypes = _aggregate_prototypes(client_stats)
+        update_generator_full(generator_, state_dicts, global_prototypes, device,
+                              p_hat_y=p_hat_y,
+                              noise_dim=noise_dim, lambda_proto=lambda_proto)
+        total_bytes += bytes_round
+
+        val_auc, test_auc = _eval_full(global_model, clients, n_clients)
+        history.append({
+            'val': val_auc, 'test': test_auc,
+            'p_hat_y': p_hat_y.tolist(),
+        })
+        cumul_mb.append(total_bytes / (1024 ** 2))
+        print(f'  [{variant_name}] R{fl_round+1:02d}: val={val_auc:.4f} '
+              f'test={test_auc:.4f} p̂={[f"{x:.3f}" for x in p_hat_y.tolist()]} '
+              f'cumul={cumul_mb[-1]:.2f}MB')
+
+        if val_auc > best_val_auc:
+            best_val_auc   = val_auc
+            best_state     = {k: v.clone() for k, v in global_model.state_dict().items()}
+            best_gen_state = {k: v.clone() for k, v in generator_.state_dict().items()}
+            no_improve = 0
+        else:
+            no_improve += 1
+            if no_improve >= patience:
+                print(f'  Early stopping at round {fl_round+1}.')
+                break
+
+    global_model.load_state_dict(best_state)
+    global_auc, per_client = evaluate_global(global_model, clients)
+    return global_auc, per_client, history, cumul_mb
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# PUBLIC API
+# ═════════════════════════════════════════════════════════════════════════════
+
+def run_fedgen_full(clients, input_dim, seed, hidden_dim, dropout, lr, batch_size,
                     n_clients=N_CLIENTS, fl_rounds=FL_ROUNDS,
-                    local_epochs=LOCAL_EPOCHS, patience=PATIENCE,
-                    noise_dim=NOISE_DIM):
+                    local_epochs=LOCAL_EPOCHS, patience=PATIENCE, noise_dim=NOISE_DIM):
     return _run_fedgen_full_generic(
         clients, input_dim, seed, hidden_dim, dropout, lr, batch_size,
-        local_train_fn=local_train_fedgen_full,
-        use_ensemble_teacher=False,
-        n_clients=n_clients, fl_rounds=fl_rounds,
-        local_epochs=local_epochs, patience=patience,
-        noise_dim=noise_dim, variant_name='fedgen_full',
-    )
+        local_train_fn=local_train_fedgen_full, use_ensemble_teacher=False,
+        n_clients=n_clients, fl_rounds=fl_rounds, local_epochs=local_epochs,
+        patience=patience, noise_dim=noise_dim, variant_name='fedgen_full')
 
-
-def run_fedgen_full_medoid(clients, input_dim, seed,
-                            hidden_dim, dropout, lr, batch_size,
+def run_fedgen_full_medoid(clients, input_dim, seed, hidden_dim, dropout, lr, batch_size,
                             n_clients=N_CLIENTS, fl_rounds=FL_ROUNDS,
-                            local_epochs=LOCAL_EPOCHS, patience=PATIENCE,
-                            noise_dim=NOISE_DIM):
+                            local_epochs=LOCAL_EPOCHS, patience=PATIENCE, noise_dim=NOISE_DIM):
     return _run_fedgen_full_generic(
         clients, input_dim, seed, hidden_dim, dropout, lr, batch_size,
-        local_train_fn=local_train_fedgen_full_medoid,
-        use_ensemble_teacher=False,
-        n_clients=n_clients, fl_rounds=fl_rounds,
-        local_epochs=local_epochs, patience=patience,
-        noise_dim=noise_dim, variant_name='fedgen_full_medoid',
-    )
+        local_train_fn=local_train_fedgen_full_medoid, use_ensemble_teacher=False,
+        n_clients=n_clients, fl_rounds=fl_rounds, local_epochs=local_epochs,
+        patience=patience, noise_dim=noise_dim, variant_name='fedgen_full_medoid')
 
-
-def run_fedgen_zhu_full(clients, input_dim, seed,
-                         hidden_dim, dropout, lr, batch_size,
+def run_fedgen_zhu_full(clients, input_dim, seed, hidden_dim, dropout, lr, batch_size,
                          n_clients=N_CLIENTS, fl_rounds=FL_ROUNDS,
-                         local_epochs=LOCAL_EPOCHS, patience=PATIENCE,
-                         noise_dim=NOISE_DIM):
+                         local_epochs=LOCAL_EPOCHS, patience=PATIENCE, noise_dim=NOISE_DIM):
     return _run_fedgen_full_generic(
         clients, input_dim, seed, hidden_dim, dropout, lr, batch_size,
-        local_train_fn=local_train_fedgen_zhu_full,
-        use_ensemble_teacher=True,
-        n_clients=n_clients, fl_rounds=fl_rounds,
-        local_epochs=local_epochs, patience=patience,
-        noise_dim=noise_dim, variant_name='fedgen_zhu_full',
-    )
+        local_train_fn=local_train_fedgen_zhu_full, use_ensemble_teacher=True,
+        n_clients=n_clients, fl_rounds=fl_rounds, local_epochs=local_epochs,
+        patience=patience, noise_dim=noise_dim, variant_name='fedgen_zhu_full')
 
-
-def run_fedgen_zhu_full_medoid(clients, input_dim, seed,
-                                hidden_dim, dropout, lr, batch_size,
+def run_fedgen_zhu_full_medoid(clients, input_dim, seed, hidden_dim, dropout, lr, batch_size,
                                 n_clients=N_CLIENTS, fl_rounds=FL_ROUNDS,
-                                local_epochs=LOCAL_EPOCHS, patience=PATIENCE,
-                                noise_dim=NOISE_DIM):
+                                local_epochs=LOCAL_EPOCHS, patience=PATIENCE, noise_dim=NOISE_DIM):
     return _run_fedgen_full_generic(
         clients, input_dim, seed, hidden_dim, dropout, lr, batch_size,
-        local_train_fn=local_train_fedgen_zhu_full_medoid,
-        use_ensemble_teacher=True,
-        n_clients=n_clients, fl_rounds=fl_rounds,
-        local_epochs=local_epochs, patience=patience,
-        noise_dim=noise_dim, variant_name='fedgen_zhu_full_medoid',
-    )
+        local_train_fn=local_train_fedgen_zhu_full_medoid, use_ensemble_teacher=True,
+        n_clients=n_clients, fl_rounds=fl_rounds, local_epochs=local_epochs,
+        patience=patience, noise_dim=noise_dim, variant_name='fedgen_zhu_full_medoid')
 
-def run_fedgen_zhu_full_no_proto(clients, input_dim, seed,
-                                  hidden_dim, dropout, lr, batch_size,
+def run_fedgen_zhu_full_no_proto(clients, input_dim, seed, hidden_dim, dropout, lr, batch_size,
                                   n_clients=N_CLIENTS, fl_rounds=FL_ROUNDS,
-                                  local_epochs=LOCAL_EPOCHS, patience=PATIENCE,
-                                  noise_dim=NOISE_DIM):
-    """Full-sharing counterpart of fedgen_zhu_no_proto."""
+                                  local_epochs=LOCAL_EPOCHS, patience=PATIENCE, noise_dim=NOISE_DIM):
     return _run_fedgen_full_generic(
         clients, input_dim, seed, hidden_dim, dropout, lr, batch_size,
-        local_train_fn=local_train_fedgen_zhu_full,
-        use_ensemble_teacher=True,
-        n_clients=n_clients, fl_rounds=fl_rounds,
-        local_epochs=local_epochs, patience=patience,
-        noise_dim=noise_dim, lambda_proto=0.0,
-        variant_name='fedgen_zhu_full_no_proto',
-    )
+        local_train_fn=local_train_fedgen_zhu_full, use_ensemble_teacher=True,
+        n_clients=n_clients, fl_rounds=fl_rounds, local_epochs=local_epochs,
+        patience=patience, noise_dim=noise_dim, lambda_proto=0.0,
+        variant_name='fedgen_zhu_full_no_proto')
+
+def run_fedgen_zhu_pyhat_full(clients, input_dim, seed, hidden_dim, dropout, lr, batch_size,
+                               n_clients=N_CLIENTS, fl_rounds=FL_ROUNDS,
+                               local_epochs=LOCAL_EPOCHS, patience=PATIENCE, noise_dim=NOISE_DIM):
+    return _run_fedgen_full_pyhat_generic(
+        clients, input_dim, seed, hidden_dim, dropout, lr, batch_size,
+        local_train_fn=local_train_fedgen_zhu_pyhat_full, use_ensemble_teacher=True,
+        n_clients=n_clients, fl_rounds=fl_rounds, local_epochs=local_epochs,
+        patience=patience, noise_dim=noise_dim, variant_name='fedgen_zhu_pyhat_full')
+
+def run_fedgen_zhu_pyhat_full_medoid(clients, input_dim, seed, hidden_dim, dropout, lr, batch_size,
+                                      n_clients=N_CLIENTS, fl_rounds=FL_ROUNDS,
+                                      local_epochs=LOCAL_EPOCHS, patience=PATIENCE, noise_dim=NOISE_DIM):
+    return _run_fedgen_full_pyhat_generic(
+        clients, input_dim, seed, hidden_dim, dropout, lr, batch_size,
+        local_train_fn=local_train_fedgen_zhu_pyhat_full_medoid, use_ensemble_teacher=True,
+        n_clients=n_clients, fl_rounds=fl_rounds, local_epochs=local_epochs,
+        patience=patience, noise_dim=noise_dim, variant_name='fedgen_zhu_pyhat_full_medoid')
+
+def run_fedgen_paper_full(clients, input_dim, seed, hidden_dim, dropout, lr, batch_size,
+                           n_clients=N_CLIENTS, fl_rounds=FL_ROUNDS,
+                           local_epochs=LOCAL_EPOCHS, patience=PATIENCE, noise_dim=NOISE_DIM):
+    """Eq 5 hard CE + centroid anchor + p̂(y). Full model sharing."""
+    return _run_fedgen_full_pyhat_generic(
+        clients, input_dim, seed, hidden_dim, dropout, lr, batch_size,
+        local_train_fn=local_train_paper_full, use_ensemble_teacher=False,
+        n_clients=n_clients, fl_rounds=fl_rounds, local_epochs=local_epochs,
+        patience=patience, noise_dim=noise_dim, variant_name='fedgen_paper_full')
+
+def run_fedgen_paper_full_no_proto(clients, input_dim, seed, hidden_dim, dropout, lr, batch_size,
+                                    n_clients=N_CLIENTS, fl_rounds=FL_ROUNDS,
+                                    local_epochs=LOCAL_EPOCHS, patience=PATIENCE, noise_dim=NOISE_DIM):
+    """Eq 5 hard CE + no anchor (λ=0) + p̂(y). Full model sharing."""
+    return _run_fedgen_full_pyhat_generic(
+        clients, input_dim, seed, hidden_dim, dropout, lr, batch_size,
+        local_train_fn=local_train_paper_full, use_ensemble_teacher=False,
+        n_clients=n_clients, fl_rounds=fl_rounds, local_epochs=local_epochs,
+        patience=patience, noise_dim=noise_dim, lambda_proto=0.0,
+        variant_name='fedgen_paper_full_no_proto')
 
 
-def run_fedgen_gmm_full(clients, input_dim, seed,
-                         hidden_dim, dropout, lr, batch_size,
+# ═════════════════════════════════════════════════════════════════════════════
+# GMM variant (standalone run loop)
+# ═════════════════════════════════════════════════════════════════════════════
+
+def run_fedgen_gmm_full(clients, input_dim, seed, hidden_dim, dropout, lr, batch_size,
                          n_clients=N_CLIENTS, fl_rounds=FL_ROUNDS,
                          local_epochs=LOCAL_EPOCHS, patience=PATIENCE):
-    """
-    Full model sharing + GMMSampler (no neural generator).
-    Mirrors fedgen_gmm but shares the full model each round.
-    """
     torch.manual_seed(seed)
     np.random.seed(seed)
 
