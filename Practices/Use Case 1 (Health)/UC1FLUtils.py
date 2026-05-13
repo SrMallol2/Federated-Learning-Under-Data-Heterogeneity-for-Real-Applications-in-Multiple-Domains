@@ -62,6 +62,7 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 from sklearn.utils.class_weight import compute_class_weight
 from sklearn.metrics import roc_auc_score
@@ -977,18 +978,21 @@ def run_fedavg_partial(clients, input_dim, seed,
 def update_generator(generator, gr_states, global_prototypes, device,
                      p_hat_y=None, n_gen_samples=128,
                      noise_dim=NOISE_DIM, gen_steps=GEN_STEPS,
-                     lambda_proto=LAMBDA_PROTO, gen_lr=GEN_LR):
+                     lambda_proto=LAMBDA_PROTO, gen_lr=GEN_LR,
+                     logit_avg=False):
     """
     Server-side generator update (partial sharing — predictor state dicts).
 
-    Loss = CE(mean_k softmax(G(y,ε)·W_k^T + b_k), y)
-         + λ · ‖G(y,ε) − z̄_y‖²
+    Loss = CE(ensemble(z), y) + λ · ‖z − z̄_y‖²
 
     Parameters
     ----------
     p_hat_y : Tensor or None
         If provided, labels are sampled from p̂(y) (paper-faithful).
         If None, falls back to balanced 50/50 sampling.
+    logit_avg : bool
+        If True, ensemble = softmax(mean(logits))    — Eq 4 paper-faithful.
+        If False, ensemble = mean(softmax(logits))    — original codebase.
     """
     all_w = [sd['weight'].to(device) for sd in gr_states]
     all_b = [sd['bias'].to(device)   for sd in gr_states]
@@ -1015,10 +1019,18 @@ def update_generator(generator, gr_states, global_prototypes, device,
         eps   = torch.randn(len(y_gen), noise_dim, device=device)
         Z_gen = generator(y_gen, eps)
 
-        probs = torch.stack([
-            torch.softmax(Z_gen @ w.T + b, dim=1)
-            for w, b in zip(all_w, all_b)
-        ]).mean(0)
+        if logit_avg:
+            # Eq 4 paper-faithful: σ(1/K Σ_k g(z; θ^p_k))
+            mean_logits = torch.stack([
+                Z_gen @ w.T + b for w, b in zip(all_w, all_b)
+            ]).mean(0)
+            probs = torch.softmax(mean_logits, dim=1)
+        else:
+            # Original codebase: 1/K Σ_k σ(g(z; θ^p_k))
+            probs = torch.stack([
+                torch.softmax(Z_gen @ w.T + b, dim=1)
+                for w, b in zip(all_w, all_b)
+            ]).mean(0)
         loss_ce = -(torch.log(probs[range(len(y_gen)), y_gen] + 1e-8)).mean()
 
         if lambda_proto > 0:
@@ -1036,10 +1048,11 @@ def update_generator(generator, gr_states, global_prototypes, device,
 def update_generator_full(generator, full_model_states, global_prototypes, device,
                            p_hat_y=None, n_gen_samples=128,
                            noise_dim=NOISE_DIM, gen_steps=GEN_STEPS,
-                           lambda_proto=LAMBDA_PROTO, gen_lr=GEN_LR):
+                           lambda_proto=LAMBDA_PROTO, gen_lr=GEN_LR,
+                           logit_avg=False):
     """
     Server-side generator update (full sharing — extracts predictor from full state dicts).
-    Same loss as update_generator. See that docstring for p_hat_y semantics.
+    Same loss as update_generator. See that docstring for p_hat_y / logit_avg semantics.
     """
     all_w = [sd['predictor.weight'].to(device) for sd in full_model_states]
     all_b = [sd['predictor.bias'].to(device)   for sd in full_model_states]
@@ -1066,10 +1079,16 @@ def update_generator_full(generator, full_model_states, global_prototypes, devic
         eps   = torch.randn(len(y_gen), noise_dim, device=device)
         Z_gen = generator(y_gen, eps)
 
-        probs = torch.stack([
-            torch.softmax(Z_gen @ w.T + b, dim=1)
-            for w, b in zip(all_w, all_b)
-        ]).mean(0)
+        if logit_avg:
+            mean_logits = torch.stack([
+                Z_gen @ w.T + b for w, b in zip(all_w, all_b)
+            ]).mean(0)
+            probs = torch.softmax(mean_logits, dim=1)
+        else:
+            probs = torch.stack([
+                torch.softmax(Z_gen @ w.T + b, dim=1)
+                for w, b in zip(all_w, all_b)
+            ]).mean(0)
         loss_ce = -(torch.log(probs[range(len(y_gen)), y_gen] + 1e-8)).mean()
 
         if lambda_proto > 0:
@@ -1083,3 +1102,188 @@ def update_generator_full(generator, full_model_states, global_prototypes, devic
 
     generator.eval()
 
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# ZHU CODE-FAITHFUL GENERATOR UPDATES
+# ═════════════════════════════════════════════════════════════════════════════
+
+
+def _diversity_loss(eps, gen_output):
+    """
+    Mode-seeking diversity loss (Mao et al., CVPR 2019).
+    Encourages generator to produce diverse outputs for different noise vectors.
+    L_div = -mean( ||G(z1) - G(z2)||_1 / (||z1 - z2||_1 + eps) )
+    """
+    n = len(eps)
+    if n < 2:
+        return torch.tensor(0.0, device=eps.device)
+    idx = torch.randperm(n, device=eps.device)
+    eps_perm    = eps[idx]
+    out_perm    = gen_output[idx]
+    dist_z      = (eps - eps_perm).abs().sum(dim=1) + 1e-8
+    dist_output = (gen_output - out_perm).abs().sum(dim=1)
+    return -(dist_output / dist_z).mean()
+
+
+def update_generator_zhu_code(generator, gr_states, global_predictor_state,
+                               label_counts, device,
+                               p_hat_y=None, n_gen_samples=128,
+                               noise_dim=NOISE_DIM, gen_steps=GEN_STEPS,
+                               gen_lr=GEN_LR,
+                               ensemble_alpha=1.0, ensemble_beta=1.0,
+                               ensemble_eta=0.01):
+    """
+    Zhu's GitHub code-faithful generator update (partial sharing).
+
+    Three-term loss:
+        L = α·teacher_loss − β·student_loss + η·diversity_loss
+
+    teacher_loss: weighted sum of per-user CEs
+        Σ_k  w_k(y) · CE(softmax(z·W_k^T + b_k), y)
+        where w_k(y) = n_k(y) / Σ_j n_j(y)
+
+    student_loss (ADVERSARIAL — note the minus sign):
+        KL( log_softmax(student(z)) || softmax(teacher_ensemble(z)) )
+        Generator tries to MAXIMIZE this — finds knowledge gaps.
+
+    diversity_loss: mode-seeking loss encouraging diverse outputs.
+
+    Parameters
+    ----------
+    gr_states : list of state dicts — per-client predictor {weight, bias}
+    global_predictor_state : state dict — aggregated global predictor (student)
+    label_counts : list of tensors — per-client label counts [n_0, n_1]
+    """
+    K = len(gr_states)
+    all_w = [sd['weight'].to(device) for sd in gr_states]
+    all_b = [sd['bias'].to(device)   for sd in gr_states]
+
+    # Student = aggregated global predictor
+    student_w = global_predictor_state['weight'].to(device)
+    student_b = global_predictor_state['bias'].to(device)
+
+    # Per-label, per-user weights: w_k(y) = n_k(y) / Σ_j n_j(y)
+    counts = torch.stack(label_counts).to(device)  # (K, num_classes)
+    label_weight_matrix = counts / (counts.sum(dim=0, keepdim=True) + 1e-8)  # (K, num_classes)
+
+    opt = torch.optim.Adam(generator.parameters(), lr=gen_lr)
+    generator.train()
+
+    for _ in range(gen_steps):
+        opt.zero_grad()
+
+        if p_hat_y is not None:
+            y_gen = torch.multinomial(p_hat_y.to(device), n_gen_samples,
+                                      replacement=True)
+        else:
+            half = n_gen_samples // 2
+            y_gen = torch.cat([
+                torch.zeros(half, dtype=torch.long, device=device),
+                torch.ones(n_gen_samples - half, dtype=torch.long, device=device),
+            ])
+        eps   = torch.randn(len(y_gen), noise_dim, device=device)
+        Z_gen = generator(y_gen, eps)
+
+        # ── teacher_loss: weighted per-user CE ────────────────────────
+        teacher_loss  = torch.tensor(0.0, device=device)
+        teacher_logit = torch.zeros(len(y_gen), all_w[0].shape[0], device=device)
+
+        for k in range(K):
+            logits_k = Z_gen @ all_w[k].T + all_b[k]
+            log_probs_k = F.log_softmax(logits_k, dim=1)
+            w_k = label_weight_matrix[k][y_gen].unsqueeze(1)  # (B, 1)
+
+            ce_k = F.nll_loss(log_probs_k, y_gen, reduction='none')  # (B,)
+            teacher_loss += (ce_k * w_k.squeeze(1)).mean()
+            teacher_logit += logits_k * w_k.expand_as(logits_k)
+
+        # ── student_loss: KL (adversarial — will be subtracted) ──────
+        student_logit = Z_gen.detach() @ student_w.T + student_b
+        student_loss  = F.kl_div(
+            F.log_softmax(student_logit, dim=1),
+            F.softmax(teacher_logit.detach(), dim=1),
+            reduction='batchmean',
+        )
+
+        # ── diversity_loss ────────────────────────────────────────────
+        div_loss = _diversity_loss(eps, Z_gen)
+
+        # ── combined loss (note MINUS on student) ─────────────────────
+        loss = (ensemble_alpha * teacher_loss
+                - ensemble_beta * student_loss
+                + ensemble_eta * div_loss)
+
+        loss.backward()
+        opt.step()
+
+    generator.eval()
+
+
+def update_generator_zhu_code_full(generator, full_model_states, global_model_state,
+                                    label_counts, device,
+                                    p_hat_y=None, n_gen_samples=128,
+                                    noise_dim=NOISE_DIM, gen_steps=GEN_STEPS,
+                                    gen_lr=GEN_LR,
+                                    ensemble_alpha=1.0, ensemble_beta=1.0,
+                                    ensemble_eta=0.01):
+    """
+    Zhu's GitHub code-faithful generator update (full sharing).
+    Same 3-term loss but extracts predictor weights from full model state dicts.
+    """
+    K = len(full_model_states)
+    all_w = [sd['predictor.weight'].to(device) for sd in full_model_states]
+    all_b = [sd['predictor.bias'].to(device)   for sd in full_model_states]
+
+    student_w = global_model_state['predictor.weight'].to(device)
+    student_b = global_model_state['predictor.bias'].to(device)
+
+    counts = torch.stack(label_counts).to(device)
+    label_weight_matrix = counts / (counts.sum(dim=0, keepdim=True) + 1e-8)
+
+    opt = torch.optim.Adam(generator.parameters(), lr=gen_lr)
+    generator.train()
+
+    for _ in range(gen_steps):
+        opt.zero_grad()
+
+        if p_hat_y is not None:
+            y_gen = torch.multinomial(p_hat_y.to(device), n_gen_samples,
+                                      replacement=True)
+        else:
+            half = n_gen_samples // 2
+            y_gen = torch.cat([
+                torch.zeros(half, dtype=torch.long, device=device),
+                torch.ones(n_gen_samples - half, dtype=torch.long, device=device),
+            ])
+        eps   = torch.randn(len(y_gen), noise_dim, device=device)
+        Z_gen = generator(y_gen, eps)
+
+        teacher_loss  = torch.tensor(0.0, device=device)
+        teacher_logit = torch.zeros(len(y_gen), all_w[0].shape[0], device=device)
+
+        for k in range(K):
+            logits_k = Z_gen @ all_w[k].T + all_b[k]
+            log_probs_k = F.log_softmax(logits_k, dim=1)
+            w_k = label_weight_matrix[k][y_gen].unsqueeze(1)
+            ce_k = F.nll_loss(log_probs_k, y_gen, reduction='none')
+            teacher_loss += (ce_k * w_k.squeeze(1)).mean()
+            teacher_logit += logits_k * w_k.expand_as(logits_k)
+
+        student_logit = Z_gen.detach() @ student_w.T + student_b
+        student_loss  = F.kl_div(
+            F.log_softmax(student_logit, dim=1),
+            F.softmax(teacher_logit.detach(), dim=1),
+            reduction='batchmean',
+        )
+
+        div_loss = _diversity_loss(eps, Z_gen)
+
+        loss = (ensemble_alpha * teacher_loss
+                - ensemble_beta * student_loss
+                + ensemble_eta * div_loss)
+
+        loss.backward()
+        opt.step()
+
+    generator.eval()
