@@ -1287,3 +1287,163 @@ def update_generator_zhu_code_full(generator, full_model_states, global_model_st
         opt.step()
 
     generator.eval()
+
+    # file: UC1FLUtils.py
+# location: append at end of file
+
+def update_generator_zhu_code_proto(generator, gr_states, global_predictor_state,
+                                     label_counts, global_prototypes, device,
+                                     lambda_proto=LAMBDA_PROTO,
+                                     p_hat_y=None, n_gen_samples=128,
+                                     noise_dim=NOISE_DIM, gen_steps=GEN_STEPS,
+                                     gen_lr=GEN_LR,
+                                     ensemble_alpha=1.0, ensemble_beta=1.0,
+                                     ensemble_eta=0.01):
+    """Zhu 3-term generator loss + prototype anchor (partial sharing)."""
+    K = len(gr_states)
+    all_w = [sd['weight'].to(device) for sd in gr_states]
+    all_b = [sd['bias'].to(device)   for sd in gr_states]
+
+    student_w = global_predictor_state['weight'].to(device)
+    student_b = global_predictor_state['bias'].to(device)
+
+    counts = torch.stack(label_counts).to(device)
+    label_weight_matrix = counts / (counts.sum(dim=0, keepdim=True) + 1e-8)
+
+    proto_t = {
+        cls: torch.tensor(v['mean'], dtype=torch.float32, device=device)
+        for cls, v in global_prototypes.items()
+    }
+
+    opt = torch.optim.Adam(generator.parameters(), lr=gen_lr)
+    generator.train()
+
+    for _ in range(gen_steps):
+        opt.zero_grad()
+
+        if p_hat_y is not None:
+            y_gen = torch.multinomial(p_hat_y.to(device), n_gen_samples,
+                                      replacement=True)
+        else:
+            half = n_gen_samples // 2
+            y_gen = torch.cat([
+                torch.zeros(half, dtype=torch.long, device=device),
+                torch.ones(n_gen_samples - half, dtype=torch.long, device=device),
+            ])
+        eps   = torch.randn(len(y_gen), noise_dim, device=device)
+        Z_gen = generator(y_gen, eps)
+
+        teacher_loss  = torch.tensor(0.0, device=device)
+        teacher_logit = torch.zeros(len(y_gen), all_w[0].shape[0], device=device)
+
+        for k in range(K):
+            logits_k = Z_gen @ all_w[k].T + all_b[k]
+            log_probs_k = F.log_softmax(logits_k, dim=1)
+            w_k = label_weight_matrix[k][y_gen].unsqueeze(1)
+            ce_k = F.nll_loss(log_probs_k, y_gen, reduction='none')
+            teacher_loss += (ce_k * w_k.squeeze(1)).mean()
+            teacher_logit += logits_k * w_k.expand_as(logits_k)
+
+        student_logit = Z_gen.detach() @ student_w.T + student_b
+        student_loss  = F.kl_div(
+            F.log_softmax(student_logit, dim=1),
+            F.softmax(teacher_logit.detach(), dim=1),
+            reduction='batchmean',
+        )
+
+        div_loss = _diversity_loss(eps, Z_gen)
+
+        if lambda_proto > 0:
+            proto_tgt = torch.stack([proto_t[int(yy.item())] for yy in y_gen])
+            loss_p    = ((Z_gen - proto_tgt) ** 2).mean()
+        else:
+            loss_p = 0.0
+
+        loss = (ensemble_alpha * teacher_loss
+                - ensemble_beta * student_loss
+                + ensemble_eta * div_loss
+                + lambda_proto * loss_p)
+
+        loss.backward()
+        opt.step()
+
+    generator.eval()
+
+
+def update_generator_zhu_code_full_proto(generator, full_model_states, global_model_state,
+                                          label_counts, global_prototypes, device,
+                                          lambda_proto=LAMBDA_PROTO,
+                                          p_hat_y=None, n_gen_samples=128,
+                                          noise_dim=NOISE_DIM, gen_steps=GEN_STEPS,
+                                          gen_lr=GEN_LR,
+                                          ensemble_alpha=1.0, ensemble_beta=1.0,
+                                          ensemble_eta=0.01):
+    """Zhu 3-term generator loss + prototype anchor (full sharing)."""
+    K = len(full_model_states)
+    all_w = [sd['predictor.weight'].to(device) for sd in full_model_states]
+    all_b = [sd['predictor.bias'].to(device)   for sd in full_model_states]
+
+    student_w = global_model_state['predictor.weight'].to(device)
+    student_b = global_model_state['predictor.bias'].to(device)
+
+    counts = torch.stack(label_counts).to(device)
+    label_weight_matrix = counts / (counts.sum(dim=0, keepdim=True) + 1e-8)
+
+    proto_t = {
+        cls: torch.tensor(v['mean'], dtype=torch.float32, device=device)
+        for cls, v in global_prototypes.items()
+    }
+
+    opt = torch.optim.Adam(generator.parameters(), lr=gen_lr)
+    generator.train()
+
+    for _ in range(gen_steps):
+        opt.zero_grad()
+
+        if p_hat_y is not None:
+            y_gen = torch.multinomial(p_hat_y.to(device), n_gen_samples,
+                                      replacement=True)
+        else:
+            half = n_gen_samples // 2
+            y_gen = torch.cat([
+                torch.zeros(half, dtype=torch.long, device=device),
+                torch.ones(n_gen_samples - half, dtype=torch.long, device=device),
+            ])
+        eps   = torch.randn(len(y_gen), noise_dim, device=device)
+        Z_gen = generator(y_gen, eps)
+
+        teacher_loss  = torch.tensor(0.0, device=device)
+        teacher_logit = torch.zeros(len(y_gen), all_w[0].shape[0], device=device)
+
+        for k in range(K):
+            logits_k = Z_gen @ all_w[k].T + all_b[k]
+            log_probs_k = F.log_softmax(logits_k, dim=1)
+            w_k = label_weight_matrix[k][y_gen].unsqueeze(1)
+            ce_k = F.nll_loss(log_probs_k, y_gen, reduction='none')
+            teacher_loss += (ce_k * w_k.squeeze(1)).mean()
+            teacher_logit += logits_k * w_k.expand_as(logits_k)
+
+        student_logit = Z_gen.detach() @ student_w.T + student_b
+        student_loss  = F.kl_div(
+            F.log_softmax(student_logit, dim=1),
+            F.softmax(teacher_logit.detach(), dim=1),
+            reduction='batchmean',
+        )
+
+        div_loss = _diversity_loss(eps, Z_gen)
+
+        if lambda_proto > 0:
+            proto_tgt = torch.stack([proto_t[int(yy.item())] for yy in y_gen])
+            loss_p    = ((Z_gen - proto_tgt) ** 2).mean()
+        else:
+            loss_p = 0.0
+
+        loss = (ensemble_alpha * teacher_loss
+                - ensemble_beta * student_loss
+                + ensemble_eta * div_loss
+                + lambda_proto * loss_p)
+
+        loss.backward()
+        opt.step()
+
+    generator.eval()

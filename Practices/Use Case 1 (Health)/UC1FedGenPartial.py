@@ -803,6 +803,62 @@ def run_fedgen_paper_partial_no_proto(clients, input_dim, seed, hidden_dim, drop
         variant_name='fedgen_paper_partial_no_proto')
 
 
+def local_train_paper_partial_medoid(model, generator, p_hat_y,
+                                      X_train, y_train, X_val, y_val,
+                                      device, batch_size=128, lr=1e-3,
+                                      local_epochs=LOCAL_EPOCHS, noise_dim=NOISE_DIM):
+    """Algorithm 1 paper-faithful local training — medoid anchor variant."""
+    loader       = DataLoader(TensorDataset(X_train, y_train),
+                              batch_size=batch_size, shuffle=True, drop_last=True)
+    criterion_r  = make_criterion(y_train.numpy(), device)
+    criterion_kd = nn.CrossEntropyLoss()
+    optimizer    = torch.optim.Adam(model.parameters(), lr=lr)
+    p_hat_dev    = p_hat_y.to(device)
+
+    best_val_auc  = 0.0
+    best_gr_state = {k: v.clone() for k, v in model.predictor.state_dict().items()}
+
+    for _ in range(local_epochs):
+        model.train()
+        for xb, yb in loader:
+            xb, yb = xb.to(device), yb.to(device)
+            n_syn = len(xb)
+            with torch.no_grad():
+                y_hat = torch.multinomial(p_hat_dev, n_syn, replacement=True)
+                eps   = torch.randn(n_syn, noise_dim, device=device)
+                Z_hat = generator(y_hat, eps)
+            optimizer.zero_grad()
+            loss_real = criterion_r(model(xb), yb)
+            loss_kd   = criterion_kd(model.predictor(Z_hat.detach()), y_hat)
+            (loss_real + loss_kd).backward()
+            optimizer.step()
+
+        model.eval()
+        with torch.no_grad():
+            vp = torch.softmax(model(X_val.to(device)), dim=1)[:, 1].cpu().numpy()
+        if len(np.unique(y_val.numpy())) > 1:
+            auc = roc_auc_score(y_val.numpy(), vp)
+            if auc > best_val_auc:
+                best_val_auc  = auc
+                best_gr_state = {k: v.clone()
+                                 for k, v in model.predictor.state_dict().items()}
+
+    per_class_stats = _compute_local_medoid_proxy(model, X_train, y_train, device)
+    c_k = _label_counter(y_train)
+    return best_gr_state, len(X_train), per_class_stats, c_k
+
+
+def run_fedgen_paper_partial_medoid(clients, input_dim, seed, hidden_dim, dropout, lr, batch_size,
+                                     n_clients=N_CLIENTS, fl_rounds=FL_ROUNDS,
+                                     local_epochs=LOCAL_EPOCHS, patience=PATIENCE, noise_dim=NOISE_DIM):
+    """Algorithm 1 paper-faithful + medoid anchor. Partial sharing."""
+    return _run_fedgen_partial_pyhat_generic(
+        clients, input_dim, seed, hidden_dim, dropout, lr, batch_size,
+        local_train_fn=local_train_paper_partial_medoid, use_ensemble_teacher=False,
+        n_clients=n_clients, fl_rounds=fl_rounds, local_epochs=local_epochs,
+        patience=patience, noise_dim=noise_dim, logit_avg=True,
+        variant_name='fedgen_paper_partial_medoid')
+
 # ═════════════════════════════════════════════════════════════════════════════
 # GMM variant (standalone run loop — no neural generator)
 # ═════════════════════════════════════════════════════════════════════════════
@@ -1007,6 +1063,147 @@ def run_fedgen_zhu_code_partial(clients, input_dim, seed, hidden_dim, dropout, l
         cumul_mb.append(total_bytes / (1024 ** 2))
         kd_flag = '(KD)' if use_kd else '(warm-up)'
         print(f'  [fedgen_zhu_code_partial] R{fl_round+1:02d} {kd_flag}: '
+              f'val={val_auc:.4f} test={test_auc:.4f} cumul={cumul_mb[-1]:.2f}MB')
+
+        if val_auc > best_val_auc:
+            best_val_auc   = val_auc
+            best_gr_state  = {k: v.clone()
+                              for k, v in global_model.predictor.state_dict().items()}
+            best_gen_state = {k: v.clone() for k, v in generator_.state_dict().items()}
+            no_improve = 0
+        else:
+            no_improve += 1
+            if no_improve >= patience:
+                print(f'  Early stopping at round {fl_round+1}.')
+                break
+
+    global_model.predictor.load_state_dict(best_gr_state)
+    global_auc, per_client = evaluate_global(global_model, clients,
+                                             use_local_encoders=True,
+                                             local_models=local_models)
+    return global_auc, per_client, history, cumul_mb
+
+# file: UC1FedGenPartial.py
+# location: append at end of file
+
+def run_fedgen_zhu_code_partial_medoid(clients, input_dim, seed, hidden_dim, dropout, lr, batch_size,
+                                        n_clients=N_CLIENTS, fl_rounds=FL_ROUNDS,
+                                        local_epochs=LOCAL_EPOCHS, patience=PATIENCE,
+                                        noise_dim=NOISE_DIM):
+    """
+    Zhu 3-term generator + medoid anchor — hybrid ablation (partial sharing).
+
+    Client side : Eq 5 paper-faithful, medoid prototypes.
+    Server side : Zhu 3-term (teacher − student + diversity) + λ·medoid MSE.
+    """
+    from UC1FLUtils import (
+        MLP, Generator, fed_avg, evaluate_global,
+        _compute_local_medoid_proxy, _aggregate_prototypes,
+        _label_counter, _aggregate_phat,
+        update_generator_zhu_code_proto,
+        N_CLIENTS as _NC, NOISE_DIM as _ND, NUM_CLASSES, device,
+    )
+
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+
+    latent_dim   = hidden_dim // 4
+    global_model = MLP(input_dim, hidden_dim=hidden_dim, dropout=dropout).to(device)
+    generator_   = Generator(latent_dim, noise_dim).to(device)
+    local_models = {
+        i: MLP(input_dim, hidden_dim=hidden_dim, dropout=dropout).to(device)
+        for i in range(n_clients)
+    }
+    for i in range(n_clients):
+        local_models[i].load_state_dict(global_model.state_dict())
+
+    n_pred      = sum(p.numel() for p in global_model.predictor.parameters())
+    n_gen       = sum(p.numel() for p in generator_.parameters())
+    bytes_round = (2 * n_pred + n_gen) * 4 * n_clients + NUM_CLASSES * 4 * n_clients
+
+    best_val_auc, best_gr_state, best_gen_state, no_improve = 0.0, None, None, 0
+    history, cumul_mb, total_bytes = [], [], 0
+
+    p_hat_y = torch.full((NUM_CLASSES,), 1.0 / NUM_CLASSES)
+
+    for fl_round in range(fl_rounds):
+        gr_states, counts, client_stats, client_c = [], [], [], []
+        use_kd = fl_round > 0
+
+        for i in range(n_clients):
+            local_models[i].predictor.load_state_dict(
+                global_model.predictor.state_dict()
+            )
+            if use_kd:
+                sd, n, stats, c_k = local_train_paper_partial_medoid(
+                    local_models[i], generator_, p_hat_y,
+                    clients[i]['X_train'], clients[i]['y_train'],
+                    clients[i]['X_val'],   clients[i]['y_val'],
+                    device, batch_size=batch_size, lr=lr,
+                    local_epochs=local_epochs, noise_dim=noise_dim,
+                )
+            else:
+                loader = DataLoader(
+                    TensorDataset(clients[i]['X_train'], clients[i]['y_train']),
+                    batch_size=batch_size, shuffle=True, drop_last=True)
+                criterion_r = make_criterion(clients[i]['y_train'].numpy(), device)
+                optimizer   = torch.optim.Adam(local_models[i].parameters(), lr=lr)
+                best_auc_i  = 0.0
+                best_sd_i   = {k: v.clone()
+                               for k, v in local_models[i].predictor.state_dict().items()}
+                for _ in range(local_epochs):
+                    local_models[i].train()
+                    for xb, yb in loader:
+                        xb, yb = xb.to(device), yb.to(device)
+                        optimizer.zero_grad()
+                        criterion_r(local_models[i](xb), yb).backward()
+                        optimizer.step()
+                    local_models[i].eval()
+                    with torch.no_grad():
+                        vp = torch.softmax(
+                            local_models[i](clients[i]['X_val'].to(device)), dim=1
+                        )[:, 1].cpu().numpy()
+                    if len(np.unique(clients[i]['y_val'].numpy())) > 1:
+                        auc = roc_auc_score(clients[i]['y_val'].numpy(), vp)
+                        if auc > best_auc_i:
+                            best_auc_i = auc
+                            best_sd_i  = {k: v.clone()
+                                          for k, v in local_models[i].predictor.state_dict().items()}
+                sd    = best_sd_i
+                n     = len(clients[i]['X_train'])
+                stats = _compute_local_medoid_proxy(
+                    local_models[i], clients[i]['X_train'], clients[i]['y_train'], device)
+                c_k   = _label_counter(clients[i]['y_train'])
+
+            gr_states.append(sd)
+            counts.append(n)
+            client_stats.append(stats)
+            client_c.append(c_k)
+
+        global_model.predictor.load_state_dict(fed_avg(gr_states, counts))
+        p_hat_y = _aggregate_phat(client_c)
+
+        global_prototypes = _aggregate_prototypes(client_stats)
+        update_generator_zhu_code_proto(
+            generator_, gr_states,
+            global_predictor_state={k: v.clone()
+                                    for k, v in global_model.predictor.state_dict().items()},
+            label_counts=client_c,
+            global_prototypes=global_prototypes,
+            device=device,
+            p_hat_y=p_hat_y,
+            noise_dim=noise_dim,
+        )
+        total_bytes += bytes_round
+
+        val_auc, test_auc = _eval_partial(global_model, local_models, clients, n_clients)
+        history.append({
+            'val': val_auc, 'test': test_auc,
+            'p_hat_y': p_hat_y.tolist(),
+        })
+        cumul_mb.append(total_bytes / (1024 ** 2))
+        kd_flag = '(KD)' if use_kd else '(warm-up)'
+        print(f'  [fedgen_zhu_code_partial_medoid] R{fl_round+1:02d} {kd_flag}: '
               f'val={val_auc:.4f} test={test_auc:.4f} cumul={cumul_mb[-1]:.2f}MB')
 
         if val_auc > best_val_auc:

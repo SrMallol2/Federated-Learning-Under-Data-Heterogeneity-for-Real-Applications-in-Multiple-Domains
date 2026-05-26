@@ -33,7 +33,7 @@ if LIB_DIR not in sys.path:
 # Paper defaults (Table I)
 DEFAULT_CONFIG = dict(
     # Dataset
-    dataset_pickle="pickle_2019-05-13-on7_2min.pkl",  # raw dataset filename
+    dataset_pickle="pickle_2019-05-13-on7_10min.pkl",  # raw dataset filename
     n_users=20,
     train_ratio=100,     # 100 APs for training
     test_ratio=16,       # 16 APs for testing
@@ -109,6 +109,7 @@ def make_args(algorithm, alpha, result_path=None, **overrides):
         f"lookback_{cfg['lookback']}",
         f"steps_{cfg['steps']}"
     )
+    dataset_path = os.path.relpath(dataset_path)
 
     # Result path
     if result_path is None:
@@ -116,6 +117,9 @@ def make_args(algorithm, alpha, result_path=None, **overrides):
             RESULTS, algorithm.lower(), f"alpha_{alpha}",
             cfg["model"], "rep_0"
         )
+    # Convert to relative path so the lib never sees the space-containing
+    # parent directories (e.g. "Use Case 2" → split on spaces downstream).
+    result_path = os.path.relpath(result_path)
     os.makedirs(result_path, exist_ok=True)
 
     args = SimpleNamespace(
@@ -250,6 +254,14 @@ def generate_partitions(alpha, lookback=60, steps=1, n_users=20, force=False):
     print(f"    Samples per user: {samples_per_user}")
     return dest_path
 
+def partitions_exist(alpha, lookback=60, steps=1, n_users=20):
+    """Check if partition files already exist for the given parameters."""
+    dest_path = os.path.join(DATA_PART, f"lookback_{lookback}", f"steps_{steps}")
+    partition_path = os.path.join(dest_path, f"u{n_users}-alpha{alpha}-ratio1")
+    train_file = os.path.join(partition_path, "train", "train.pt")
+    test_file = os.path.join(partition_path, "test", "test.pt")
+    return os.path.exists(train_file) and os.path.exists(test_file)
+
 
 def _save_partition(partition_path, mode, X, y, n_users):
     """Save partitioned data in the .pt format expected by the codebase."""
@@ -345,11 +357,29 @@ def evaluate_server(server):
     }
 
 
-def run_experiment(algorithm, alpha, seed=0, **overrides):
+def result_exists(algorithm, alpha, model="lstm"):
+    """Check whether full_results.pkl exists for a given (algorithm, alpha) combo."""
+    path = os.path.join(
+        RESULTS, algorithm.lower(), f"alpha_{alpha}", model, "rep_0",
+        "full_results.pkl"
+    )
+    return os.path.exists(path)
+
+
+def run_experiment(algorithm, alpha, seed=0, retrain=False, **overrides):
     """
     Full pipeline: create args → create server → train → evaluate → save.
-    Returns (server, metrics, per_user_eval).
+    Returns (server, result).
+
+    If retrain=False (default) and results already exist, skips training
+    and returns (None, loaded_result).
     """
+    model = overrides.get("model", DEFAULT_CONFIG["model"])
+    if not retrain and result_exists(algorithm, alpha, model):
+        print(f"[✓] Results already exist for {algorithm} α={alpha} — skipping "
+              f"(set retrain=True to force).")
+        return None, load_result(algorithm, alpha, model)
+
     torch.manual_seed(seed)
     np.random.seed(seed)
 
