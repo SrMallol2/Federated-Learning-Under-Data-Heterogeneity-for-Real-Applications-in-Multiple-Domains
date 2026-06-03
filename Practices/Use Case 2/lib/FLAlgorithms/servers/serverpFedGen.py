@@ -97,7 +97,8 @@ class FedGen(Server):
             if best_evaluation_metric is None or current_evaluation_metric < best_evaluation_metric:
                 self.save_model()
                 for user in self.selected_users:
-                    user.save_model()
+                    if hasattr(user, 'save_model'):
+                        user.save_model()
                 print('The model is saved!')
                 best_evaluation_metric = current_evaluation_metric
                 best_evaluation_metric_epoch = glob_iter
@@ -269,8 +270,8 @@ class FedGen(Server):
                     teacher_loss_ = torch.mean(self.generative_model.l1_loss(user_output_logp_, y_input))
                     teacher_loss += teacher_loss_
                     teacher_logit += user_result_given_gen['logit']
-
-                ######### get student loss ############
+                if len(self.selected_users) > 0:
+                    teacher_logit = teacher_logit / len(self.selected_users)
                 student_output = student_model(gen_output, start_layer_idx=latent_layer_idx, logit=True)
                 student_loss = F.mse_loss(student_output['logit'], teacher_logit)
                 if self.ensemble_beta > 0:

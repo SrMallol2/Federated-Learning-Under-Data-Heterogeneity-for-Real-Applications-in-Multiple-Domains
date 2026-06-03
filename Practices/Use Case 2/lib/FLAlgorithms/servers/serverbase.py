@@ -76,11 +76,12 @@ class Server:
         if selected:
             assert (self.selected_users is not None and len(self.selected_users) > 0)
             users = self.selected_users
+        shared_keyword = 'decode_fc2' if mode in ('partial', 'decode') else mode
         for user in users:
-            if mode == 'all':  # share only subset of parameters
+            if mode == 'all':
                 user.set_parameters(self.model, beta=beta)
-            else:  # share all parameters
-                user.set_shared_parameters(self.model, mode=mode)
+            else:
+                user.set_shared_parameters(self.model, mode=shared_keyword)
 
     def add_parameters(self, user, ratio, partial=False):
         if partial:

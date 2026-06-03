@@ -54,14 +54,14 @@ DEFAULT_CONFIG = dict(
     lamda=1,
     mix_lambda=0.1,
     embedding=1,
-    num_glob_iters=100,
-    local_epochs=50,
+    num_glob_iters=300,
+    local_epochs=20,
     num_users=20,
     K=1,
     times=1,
     # Early stopping
     early_stopping="True",
-    early_stopping_criteria="unscaled_mae",
+    early_stopping_criteria="mae",
     early_stopping_patience=50,
     # Device
     device="cuda:0" if torch.cuda.is_available() else "cpu",
@@ -109,7 +109,6 @@ def make_args(algorithm, alpha, result_path=None, **overrides):
         f"lookback_{cfg['lookback']}",
         f"steps_{cfg['steps']}"
     )
-    dataset_path = os.path.relpath(dataset_path)
 
     # Result path
     if result_path is None:
@@ -117,8 +116,7 @@ def make_args(algorithm, alpha, result_path=None, **overrides):
             RESULTS, algorithm.lower(), f"alpha_{alpha}",
             cfg["model"], "rep_0"
         )
-    # Convert to relative path so the lib never sees the space-containing
-    # parent directories (e.g. "Use Case 2" → split on spaces downstream).
+    # Use relative path so the lib never sees spaces in parent dirs
     result_path = os.path.relpath(result_path)
     os.makedirs(result_path, exist_ok=True)
 
@@ -237,7 +235,7 @@ def generate_partitions(alpha, lookback=60, steps=1, n_users=20, force=False):
     # Split test/validation data
     test_X, test_y = divide_test_data(
         n_users, src_aps_val, val_data_by_ap, val_target_by_ap,
-        Labels, unknown_test=False
+        Labels, unknown_test=True
     )
 
     # Save train data
@@ -366,20 +364,11 @@ def result_exists(algorithm, alpha, model="lstm"):
     return os.path.exists(path)
 
 
-def run_experiment(algorithm, alpha, seed=0, retrain=False, **overrides):
+def run_experiment(algorithm, alpha, seed=0, **overrides):
     """
     Full pipeline: create args → create server → train → evaluate → save.
     Returns (server, result).
-
-    If retrain=False (default) and results already exist, skips training
-    and returns (None, loaded_result).
     """
-    model = overrides.get("model", DEFAULT_CONFIG["model"])
-    if not retrain and result_exists(algorithm, alpha, model):
-        print(f"[✓] Results already exist for {algorithm} α={alpha} — skipping "
-              f"(set retrain=True to force).")
-        return None, load_result(algorithm, alpha, model)
-
     torch.manual_seed(seed)
     np.random.seed(seed)
 

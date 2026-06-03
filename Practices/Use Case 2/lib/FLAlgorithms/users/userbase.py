@@ -210,18 +210,32 @@ class User:
 
     def test_personalized_model(self):
         self.model.eval()
-        test_acc = 0
-        loss = 0
         self.update_parameters(self.personalized_model_bar)
-        for x, y in self.testloaderfull:
-            output = self.model(x)['output']
-            loss += self.loss(output, y)
-            test_acc += (torch.sum(torch.argmax(output, dim=1) == y)).item()
-            # @loss += self.loss(output, y)
-            # print(self.id + ", Test Accuracy:", test_acc / y.shape[0] )
-            # print(self.id + ", Test Loss:", loss)
-        self.update_parameters(self.local_model)
-        return test_acc, y.shape[0], loss
+        total = 0
+        if self.problem_type == 'classification':
+            test_acc = 0
+            loss = 0
+            for x, y in self.testloader:                 # batched, not testloaderfull
+                x = x.to(self.device); y = y.to(self.device)
+                with torch.no_grad():
+                    output = self.model(x)['output']
+                    loss += self.loss(output, y) * y.shape[0]
+                    test_acc += torch.sum(torch.argmax(output, dim=1) == y).item()
+                total += y.shape[0]
+            self.update_parameters(self.local_model)
+            return test_acc, total, loss
+        else:  # regression: return summed-MAE so the server's /num_samples gives mean MAE
+            mae_sum = 0.0
+            loss = 0.0
+            for x, y in self.testloader:                 # batched, not testloaderfull
+                x = x.to(self.device); y = y.to(self.device)
+                with torch.no_grad():
+                    output = self.model(x)['output']
+                    loss += self.loss(output, y).item() * y.shape[0]
+                    mae_sum += torch.sum(torch.abs(output - y)).item()
+                total += y.shape[0]
+            self.update_parameters(self.local_model)
+            return mae_sum, total, torch.tensor(loss)
 
     def get_next_train_batch(self, return_y_distribution=True):
         try:

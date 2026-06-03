@@ -69,7 +69,7 @@ class FedAvg(Server):
                 self.evaluate_personalized_model()
 
             self.timestamp = time.time()  # log server-agg start time
-            self.aggregate_parameters()
+            self.aggregate_parameters(partial=(self.mode != 'all'))
             curr_timestamp = time.time()  # log  server-agg end time
             agg_time = curr_timestamp - self.timestamp
             self.metrics['server_agg_time'].append(agg_time)

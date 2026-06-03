@@ -96,7 +96,7 @@ class UserpFedGen(User):
                         sampled_y = torch.tensor(sampled_y)
                         sampled_y = sampled_y.to(self.device)
                     elif self.problem_type == 'regression':
-                        target_p = logit_given_gen
+                        target_p = logit_given_gen.clone().detach()
                         sampled_y = np.array([random.uniform(*self.output_range) for _ in range(self.gen_batch_size * y.shape[-1])]).reshape(
                             -1, y.shape[-1])
                         sampled_y = torch.tensor(sampled_y, dtype=torch.float32)
