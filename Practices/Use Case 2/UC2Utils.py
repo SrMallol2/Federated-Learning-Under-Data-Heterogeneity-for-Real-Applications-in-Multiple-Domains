@@ -83,7 +83,7 @@ GENERATOR_SIZE_MB = 0.113     # |ω| generative model
 # ═══════════════════════════════════════════════════════════════
 # ARGS NAMESPACE — feed into existing server classes
 # ═══════════════════════════════════════════════════════════════
-def make_args(algorithm, alpha, result_path=None, **overrides):
+def make_args(algorithm, alpha, result_path=None, seed =0 ,**overrides,):
     """
     Create an args namespace compatible with the codebase's server classes.
 
@@ -114,7 +114,7 @@ def make_args(algorithm, alpha, result_path=None, **overrides):
     if result_path is None:
         result_path = os.path.join(
             RESULTS, algorithm.lower(), f"alpha_{alpha}",
-            cfg["model"], "rep_0"
+            cfg["model"], f"rep_{seed}"
         )
     # Use relative path so the lib never sees spaces in parent dirs
     result_path = os.path.relpath(result_path)
@@ -355,10 +355,10 @@ def evaluate_server(server):
     }
 
 
-def result_exists(algorithm, alpha, model="lstm"):
+def result_exists(algorithm, alpha, model="lstm",seed =0):
     """Check whether full_results.pkl exists for a given (algorithm, alpha) combo."""
     path = os.path.join(
-        RESULTS, algorithm.lower(), f"alpha_{alpha}", model, "rep_0",
+        RESULTS, algorithm.lower(), f"alpha_{alpha}", model, f"rep_{seed}",
         "full_results.pkl"
     )
     return os.path.exists(path)
@@ -372,7 +372,7 @@ def run_experiment(algorithm, alpha, seed=0, **overrides):
     torch.manual_seed(seed)
     np.random.seed(seed)
 
-    args = make_args(algorithm, alpha, **overrides)
+    args = make_args(algorithm, alpha, seed=seed, **overrides)
     server = create_server(args)
     metrics = train_server(server, args)
 
@@ -411,10 +411,10 @@ def _get_alpha(args):
     return "?"
 
 
-def load_result(algorithm, alpha, model="lstm"):
+def load_result(algorithm, alpha, model="lstm",seed =0):
     """Load a saved result for a specific (algorithm, alpha) combo."""
     path = os.path.join(
-        RESULTS, algorithm.lower(), f"alpha_{alpha}", model, "rep_0",
+        RESULTS, algorithm.lower(), f"alpha_{alpha}", model, f"rep_{seed}",
         "full_results.pkl"
     )
     if not os.path.exists(path):

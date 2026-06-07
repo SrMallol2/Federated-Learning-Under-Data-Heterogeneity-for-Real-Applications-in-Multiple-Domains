@@ -206,7 +206,7 @@ class User:
             test_metrics['unscaled_mae'] /= len(self.testloader)
             test_metrics['unscaled_mape'] /= len(self.testloader)
         loss /= len(self.testloader)
-        return test_metrics, loss, y.shape[0]
+        return test_metrics, loss, self.test_samples
 
     def test_personalized_model(self):
         self.model.eval()
