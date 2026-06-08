@@ -272,7 +272,7 @@ def plot_auc_vs_alpha(df, data_case='filtered', metric='perclient_mean', ax=None
             a.errorbar(sub.alpha, sub[metric], yerr=sub.get(metric.replace('mean', 'std')),
                        marker='o', ms=5, lw=1.8, ls=ls, capsize=3,
                        label=v + (' (artifact)' if v in ARTIFACT_FLAG else ''))
-        a.set_xscale('log'); a.invert_xaxis(); a.grid(alpha=.3)
+        a.set_xscale('log'); a.grid(alpha=.3)   # ascending: small α left, large α right
         a.axhline(.5, color='grey', ls=':', lw=1)
         a.set_title(f'{sh}-sharing'); a.set_xlabel('Dirichlet α (log, ←more heterogeneous)')
         a.legend(fontsize=7, ncol=1)
@@ -327,8 +327,8 @@ def plot_worst_client(df, data_case='filtered', ax=None):
         sub = d[d.variant == v].sort_values('alpha')
         c, ls = _style(v)
         ax.plot(sub.alpha, sub.perclient_worst_mean, marker='s', ls=ls, lw=1.6, label=v)
-    ax.set_xscale('log'); ax.invert_xaxis(); ax.axhline(.5, color='red', ls=':', lw=1.2,
-                                                         label='random (0.5)')
+    ax.set_xscale('log'); ax.axhline(.5, color='red', ls=':', lw=1.2,
+                                     label='random (0.5)')   # ascending α left→right
     ax.set_xlabel('Dirichlet α (log)'); ax.set_ylabel('worst-client AUC')
     ax.set_title(f'UC1 — worst-served client (equity)  [{data_case}]', fontweight='bold')
     ax.grid(alpha=.3); ax.legend(fontsize=7, ncol=2)

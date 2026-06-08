@@ -90,7 +90,7 @@ def plot_mse_vs_alpha(df, protocol='client_local', ax=None):
             continue
         ax.errorbar(sub.alpha, sub.best_mse, yerr=sub.best_mse_std, marker='o', ms=6,
                     lw=1.9, capsize=3, color=COLORS.get(m), label=m)
-    ax.set_xscale('log'); ax.invert_xaxis(); ax.grid(alpha=.3)
+    ax.set_xscale('log'); ax.grid(alpha=.3)   # ascending: small α left, large α right
     ax.set_xlabel('Dirichlet α (log, ←more heterogeneous)')
     ax.set_ylabel('best scaled MSE (lower = better)')
     ax.set_title(f'UC2 — accuracy vs heterogeneity  [{protocol}]', fontweight='bold')

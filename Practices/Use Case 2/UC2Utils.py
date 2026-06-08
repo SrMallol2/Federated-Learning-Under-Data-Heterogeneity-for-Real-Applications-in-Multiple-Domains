@@ -450,29 +450,43 @@ def extract_final_metrics(results):
         glob_metrics = r["metrics"].get("glob_test_metric", [])
         if not glob_metrics:
             continue
-        # Get the best metric (lowest MAE)
-        best_idx = np.argmin([m.get("unscaled_mae", float("inf"))
-                              for m in glob_metrics])
+        # Select the best round by the SCALED mse (computed directly on output vs y).
+        # NOTE: do NOT select on `unscaled_mae` — it lives in 10**(...) space, is
+        # frozen (~0.4% range over 300 rounds) and anti-correlated with the real
+        # error (r=-0.77), so it is unfit for model selection. Falls back to
+        # unscaled_mae only if scaled mse is absent.
+        def _sel_key(m):
+            return m.get("mse", m.get("unscaled_mae", float("inf")))
+        best_idx = int(np.argmin([_sel_key(m) for m in glob_metrics]))
         best = glob_metrics[best_idx]
 
-        # Per-user equity
+        # Per-user equity (scaled mse preferred; unscaled kept for reference)
         per_user_metrics = r.get("per_user", {}).get("metrics", {})
+        per_user_mse = per_user_metrics.get("mse", [])
         per_user_mae = per_user_metrics.get("unscaled_mae", [])
 
+        mse = best.get("mse", None)
         rows.append({
             "algorithm": alg,
             "alpha": alpha,
             "best_round": best_idx,
             "n_rounds": r["n_rounds"],
+            # ── PRIMARY (scaled, honest) ──
+            "mse": mse,
+            "rmse": (float(np.sqrt(mse)) if mse is not None else None),
             "mae": best.get("mae", None),
+            # ── reference only (real-units, tail-dominated; do not select on these) ──
             "unscaled_mae": best.get("unscaled_mae", None),
-            "mape": best.get("mape", None),
             "unscaled_mape": best.get("unscaled_mape", None),
+            # ── per-client equity ──
+            "per_user_mse_list": per_user_mse,
+            "per_user_mse_std": np.std(per_user_mse) if per_user_mse else None,
+            "per_user_mse_cv": (np.std(per_user_mse) / np.mean(per_user_mse)
+                                if per_user_mse and np.mean(per_user_mse) > 0
+                                else None),
+            # kept for backward compatibility with existing notebook cells
             "per_user_mae_list": per_user_mae,
             "per_user_mae_std": np.std(per_user_mae) if per_user_mae else None,
-            "per_user_mae_cv": (np.std(per_user_mae) / np.mean(per_user_mae)
-                                if per_user_mae and np.mean(per_user_mae) > 0
-                                else None),
         })
     return rows
 
@@ -483,6 +497,13 @@ def extract_final_metrics(results):
 def comm_cost_fedavg(n_rounds, n_users_per_round, model_size_mb=MODEL_SIZE_MB):
     """C(FL) = 2|θ| * Σ|St|"""
     return 2 * model_size_mb * n_rounds * n_users_per_round
+
+
+def comm_cost_fedavg_partial(n_rounds, n_users_per_round,
+                             shared_size_mb=MODEL_SHARED_SIZE_MB):
+    """FedAvg with partial sharing: only the shared head (decode_fc2) is exchanged.
+    C = 2|gr(θ)| * Σ|St|.  NOTE: |gr(θ)|≈2e-3 MB vs full |θ|=3.7 MB (~1850x smaller)."""
+    return 2 * shared_size_mb * n_rounds * n_users_per_round
 
 
 def comm_cost_fedgen(n_rounds, n_users_per_round,
@@ -507,7 +528,11 @@ def compute_comm_costs(results, n_users_per_round=20):
         if "Centralized" in alg:
             costs[(alg, alpha)] = 0  # data already local (or: dataset size)
         elif "FedAvg" in alg:
-            costs[(alg, alpha)] = comm_cost_fedavg(n_rounds, n_users_per_round)
+            # partial sharing exchanges only the head -> ~1850x cheaper.
+            if "partial" in alg.lower():
+                costs[(alg, alpha)] = comm_cost_fedavg_partial(n_rounds, n_users_per_round)
+            else:
+                costs[(alg, alpha)] = comm_cost_fedavg(n_rounds, n_users_per_round)
         elif "FedGen" in alg:
             # Check if partial mode
             if "partial" in alg.lower() or "pFed" in alg:
@@ -552,10 +577,12 @@ def setup_plot_style():
     })
 
 
-def plot_alpha_sensitivity(rows, metric="unscaled_mae", ylabel="Unscaled MAE (MB)"):
+def plot_alpha_sensitivity(rows, metric="mse", ylabel="Test MSE (scaled, lower=better)"):
     """
     Plot metric vs alpha, one curve per algorithm.
     `rows` is the output of extract_final_metrics().
+    Default metric is the scaled `mse` (honest); pass metric='unscaled_mae' only
+    for the real-units reference plot.
     """
     setup_plot_style()
     fig, ax = plt.subplots()
@@ -583,11 +610,13 @@ def plot_alpha_sensitivity(rows, metric="unscaled_mae", ylabel="Unscaled MAE (MB
     return fig, ax
 
 
-def plot_pareto_frontier(rows, costs, metric="unscaled_mae",
-                         ylabel="Unscaled MAE (MB)"):
+def plot_pareto_frontier(rows, costs, metric="mse",
+                         ylabel="Test MSE (scaled, lower=better)"):
     """
     Communication cost (x) vs accuracy (y) Pareto plot.
     Each point is one (algorithm, alpha) combination.
+    Default y is scaled `mse`; `costs` must come from compute_comm_costs (which
+    now charges partial sharing the head-only cost).
     """
     setup_plot_style()
     fig, ax = plt.subplots()
@@ -626,10 +655,10 @@ def plot_pareto_frontier(rows, costs, metric="unscaled_mae",
     return fig, ax
 
 
-def plot_per_client_equity(rows, metric_key="per_user_mae_list",
-                           ylabel="Unscaled MAE per deployment"):
+def plot_per_client_equity(rows, metric_key="per_user_mse_list",
+                           ylabel="Per-deployment test MSE (scaled)"):
     """
-    Box plot of per-client MAE for each (algorithm, alpha).
+    Box plot of per-client (scaled) MSE for each (algorithm, alpha).
     """
     setup_plot_style()
     n_alphas = len(set(r["alpha"] for r in rows))
@@ -666,9 +695,11 @@ def plot_per_client_equity(rows, metric_key="per_user_mae_list",
     return fig, axes
 
 
-def plot_training_curves(results, metric="unscaled_mae",
-                         ylabel="Unscaled MAE (MB)"):
-    """Plot training metric over rounds for multiple results."""
+def plot_training_curves(results, metric="mse",
+                         ylabel="Test MSE (scaled, lower=better)"):
+    """Plot training metric over rounds for multiple results.
+    Default is scaled `mse` (shows real convergence/divergence); `unscaled_mae`
+    is frozen and should not be used to judge training dynamics."""
     setup_plot_style()
     fig, ax = plt.subplots()
 
