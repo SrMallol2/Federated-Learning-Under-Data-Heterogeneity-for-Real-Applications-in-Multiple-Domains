@@ -1199,12 +1199,11 @@ def update_generator_zhu_code(generator, gr_states, global_predictor_state,
             teacher_logit += logits_k * w_k.expand_as(logits_k)
 
         # ── student_loss: KL (adversarial — will be subtracted) ──────
-        student_logit = Z_gen.detach() @ student_w.T + student_b
-        student_loss  = F.kl_div(
-            F.log_softmax(student_logit, dim=1),
-            F.softmax(teacher_logit.detach(), dim=1),
-            reduction='batchmean',
-        )
+        # before:  student_logit = Z_gen.detach() @ student_w.T + student_b
+        student_logit = Z_gen @ student_w.T + student_b          # let gradient reach the generator
+        student_loss  = F.kl_div(F.log_softmax(student_logit, dim=1),
+                                F.softmax(teacher_logit, dim=1),  # drop .detach() to match Zhu
+                                reduction='batchmean')
 
         # ── diversity_loss ────────────────────────────────────────────
         div_loss = _diversity_loss(eps, Z_gen)

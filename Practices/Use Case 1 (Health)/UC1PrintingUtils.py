@@ -1151,6 +1151,7 @@ def load_results(fedavg_dir, fedgen_dir, alpha_sweep, seeds,
         for vname in variants:
             base = fedgen_dir if vname.startswith('fedgen') else fedavg_dir
             aucs, per_client, histories, mbs = [], [], [], []
+            valsel, pc_means, pc_worsts = [], [], []
             for seed in seeds:
                 p = os.path.join(base, data_case,
                                  f'alpha_{alpha}', f'seed_{seed}', f'{vname}.json')
@@ -1160,13 +1161,22 @@ def load_results(fedavg_dir, fedgen_dir, alpha_sweep, seeds,
                     per_client.append(r['per_client'])
                     histories.append(r['history'])
                     mbs.append(r['cumul_mb'])
+                    hv = [h for h in r['history'] if 'val' in h and 'test' in h]
+                    bi = max(range(len(hv)), key=lambda i: hv[i]['val'])
+                    valsel.append(hv[bi]['test'])                       # checkpoint-fixed pooled
+                    pcv = list(r['per_client'].values())
+                    pc_means.append(sum(pcv) / len(pcv))               # honest metric
+                    pc_worsts.append(min(pcv))                         # equity
                 else:
                     missing.append(p)
             data[alpha][vname] = {
-                'test_aucs' : aucs,
-                'per_client': per_client,
-                'histories' : histories,
-                'cumul_mbs' : mbs,
+                'test_aucs'      : aucs,
+                'valsel_pooled'  : valsel,
+                'perclient_means': pc_means,
+                'perclient_worsts': pc_worsts,
+                'per_client'     : per_client,
+                'histories'      : histories,
+                'cumul_mbs'      : mbs,
             }
  
     if missing:
