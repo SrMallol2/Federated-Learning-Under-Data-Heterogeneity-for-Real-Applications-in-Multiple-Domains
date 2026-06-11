@@ -1269,10 +1269,10 @@ def update_generator_zhu_code_full(generator, full_model_states, global_model_st
             teacher_loss += (ce_k * w_k.squeeze(1)).mean()
             teacher_logit += logits_k * w_k.expand_as(logits_k)
 
-        student_logit = Z_gen.detach() @ student_w.T + student_b
+        student_logit = Z_gen @ student_w.T + student_b          # let gradient reach the generator
         student_loss  = F.kl_div(
             F.log_softmax(student_logit, dim=1),
-            F.softmax(teacher_logit.detach(), dim=1),
+            F.softmax(teacher_logit, dim=1),          # drop .detach() to match Zhu
             reduction='batchmean',
         )
 
@@ -1343,10 +1343,10 @@ def update_generator_zhu_code_proto(generator, gr_states, global_predictor_state
             teacher_loss += (ce_k * w_k.squeeze(1)).mean()
             teacher_logit += logits_k * w_k.expand_as(logits_k)
 
-        student_logit = Z_gen.detach() @ student_w.T + student_b
+        student_logit = Z_gen @ student_w.T + student_b          # let gradient reach the generator
         student_loss  = F.kl_div(
             F.log_softmax(student_logit, dim=1),
-            F.softmax(teacher_logit.detach(), dim=1),
+            F.softmax(teacher_logit, dim=1),          # drop .detach() to match Zhu
             reduction='batchmean',
         )
 
@@ -1422,10 +1422,10 @@ def update_generator_zhu_code_full_proto(generator, full_model_states, global_mo
             teacher_loss += (ce_k * w_k.squeeze(1)).mean()
             teacher_logit += logits_k * w_k.expand_as(logits_k)
 
-        student_logit = Z_gen.detach() @ student_w.T + student_b
+        student_logit = Z_gen @ student_w.T + student_b          # let gradient reach the generator
         student_loss  = F.kl_div(
             F.log_softmax(student_logit, dim=1),
-            F.softmax(teacher_logit.detach(), dim=1),
+            F.softmax(teacher_logit, dim=1),          # drop .detach() to match Zhu
             reduction='batchmean',
         )
 
