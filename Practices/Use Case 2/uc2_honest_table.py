@@ -8,11 +8,24 @@ Reports the *scaled* mse/mae (computed directly on output vs y in
 userbase.test — correct), NOT unscaled_mae/mape (10**(...) space, dominated by
 the largest-load samples, ~1e8 MAPE). Selection: best round by scaled mse.
 
+METRIC CAVEAT (important): clients train on L1 (scaled MAE). For FedAvg the
+scaled MSE never improves on the round-0 init (best-by-MSE selects the
+UNTRAINED model) while MAE decreases monotonically — that is a stall under
+MSE, NOT divergence. Statements about learning dynamics must use MAE;
+best_mse is kept for cross-method comparison only.
+
+Column semantics:
+  mse_improves : training beat the round-0 init on scaled MSE (argmin > 0)
+  diverges     : true divergence — non-finite metrics or final MAE worse
+                 than the round-0 init (does not fire on any current run)
+
 Public API (importable from the notebook):
   PROTOCOLS                                  -> {'client_local': 'results/newpart', 'global': ...}
   build_dataframe()                          -> pandas.DataFrame (both protocols)
   write_csv(path=None, df=None)              -> path written
   trajectory(protocol, method, alpha, rep=0) -> list[mse_per_round]
+  le_sweep_dataframe()                       -> local-steps sweep (le = batch steps/round, K=1)
+  plot_le_sweep(df)                          -> MAE-based sweep figure (FedAvg vs FedGen)
   plot_mse_vs_alpha(df, protocol='client_local')
   plot_convergence(protocol='client_local', alpha='1.0')
   plot_local_vs_global(df)
@@ -47,19 +60,26 @@ def trajectory(protocol, method, alpha, rep=0):
 
 
 def build_dataframe():
+    import math
     import pandas as pd
     out = []
     for proto in PROTOCOLS:
         for m in METHODS:
             for a in ALPHAS:
-                bms, lms, diverged = [], [], []
+                bms, lms, bmae, lmae, improves, diverged = [], [], [], [], [], []
                 for rep in _repdirs(proto, m, a):
                     gm = _gm(rep)
                     if not gm:
                         continue
                     mse = [x['mse'] for x in gm]
+                    mae = [x['mae'] for x in gm]
                     bms.append(min(mse)); lms.append(mse[-1])
-                    diverged.append(min(range(len(mse)), key=lambda i: mse[i]) == 0)
+                    bmae.append(min(mae)); lmae.append(mae[-1])
+                    # did training ever beat the round-0 init on MSE?
+                    improves.append(min(range(len(mse)), key=lambda i: mse[i]) > 0)
+                    # true divergence: non-finite metrics or final MAE worse than init
+                    finite = all(math.isfinite(v) for v in mse + mae)
+                    diverged.append((not finite) or mae[-1] > mae[0])
                 if not bms:
                     continue
                 out.append(dict(
@@ -67,6 +87,9 @@ def build_dataframe():
                     best_mse=round(st.mean(bms), 4),
                     best_mse_std=round(st.pstdev(bms) if len(bms) > 1 else 0.0, 4),
                     last_mse=round(st.mean(lms), 4),
+                    best_mae=round(st.mean(bmae), 4),
+                    last_mae=round(st.mean(lmae), 4),
+                    mse_improves=bool(all(improves)),
                     diverges=bool(any(diverged))))
     return pd.DataFrame(out)
 
@@ -76,6 +99,72 @@ def write_csv(path=None, df=None):
     path = path or os.path.join(BASE, 'uc2_results.csv')
     df.to_csv(path, index=False)
     return path
+
+
+# ───────────────────── local-steps sweep (le = batch steps per round) ─────────
+# `local_epochs` in this framework is the number of mini-batch steps per round
+# (K=1, batch 32), NOT full passes over the client data. le ∈ {1,5,10} live in
+# {method}-le{N}/ dirs; le=20 is the existing baseline ({method}/), seed 0 only.
+#
+# Read the sweep on MAE (the L1 objective the clients actually train). best_mse
+# is uninformative here: for FedAvg argmin(mse) is the untrained round-0 model,
+# so its best-MSE row is flat across le by construction.
+
+def le_sweep_dataframe(protocol='client_local', methods=('fedavg', 'fedgen'),
+                       les=(1, 5, 10, 20), rep=0):
+    import pandas as pd
+    out = []
+    for m in methods:
+        for le in les:
+            d = m if le == 20 else f'{m}-le{le}'
+            for a in ALPHAS:
+                gm = _gm(os.path.join(PROTOCOLS[protocol], d,
+                                      f'alpha_{a}', 'lstm', f'rep_{rep}'))
+                if not gm:
+                    continue
+                mse = [x['mse'] for x in gm]
+                mae = [x['mae'] for x in gm]
+                out.append(dict(
+                    method=m, le=le, alpha=float(a), rounds=len(gm),
+                    first_mae=round(mae[0], 4),
+                    best_mae=round(min(mae), 4),
+                    last_mae=round(mae[-1], 4),
+                    best_mse=round(min(mse), 4),
+                    last_mse=round(mse[-1], 4),
+                    mse_improves=bool(min(range(len(mse)), key=lambda i: mse[i]) > 0)))
+    return pd.DataFrame(out)
+
+
+def plot_le_sweep(df=None, metric='best_mae', ax=None):
+    """Error vs local steps per round, one panel per method, one line per alpha.
+    Default metric is best scaled MAE (training-aligned); caveats: single seed,
+    fixed 300-round cap (le conflated with total compute), fedgen-le5 early-stops."""
+    import matplotlib.pyplot as plt
+    df = le_sweep_dataframe() if df is None else df
+    methods = sorted(df.method.unique())
+    if ax is None:
+        fig, axes = plt.subplots(1, len(methods), figsize=(6.2 * len(methods), 4.8),
+                                 sharey=True)
+    else:
+        axes = ax
+    if len(methods) == 1:
+        axes = [axes]
+    for a_, m in zip(axes, methods):
+        sub = df[df.method == m]
+        for alpha in sorted(sub.alpha.unique()):
+            s = sub[sub.alpha == alpha].sort_values('le')
+            # NB: s['le'], not s.le — pandas reserves .le for the <= operator
+            a_.plot(s['le'], s[metric], 'o-', lw=1.8, ms=5, label=f'α={alpha}')
+        a_.set_xticks(sorted(df['le'].unique()))
+        a_.set_xlabel('local steps per round (batch=32, K=1)')
+        a_.set_title(m); a_.grid(alpha=.3)
+    axes[0].set_ylabel(f'{metric} (scaled, lower = better)')
+    axes[-1].legend(fontsize=8)
+    import matplotlib.pyplot as _plt
+    _plt.suptitle('UC2 — error vs local steps (seed 0; MAE = trained objective)',
+                  fontweight='bold')
+    _plt.tight_layout()
+    return _plt.gcf()
 
 
 # ───────────────────────── plotting ─────────────────────────

@@ -74,10 +74,13 @@ DEFAULT_CONFIG = dict(
 # Alpha sweep for experiments
 ALPHA_SWEEP = [0.5, 1.0, 5.0, 10.0]
 
-# Model sizes in MB (from the paper, Section IV-C)
-MODEL_SIZE_MB = 3.7           # |θ| full LSTM model
-MODEL_SHARED_SIZE_MB = 2e-3   # |gr(θ)| last layer only
-GENERATOR_SIZE_MB = 0.113     # |ω| generative model
+# Model sizes in MB — MEASURED from the instantiated objects at float32
+# (sum(p.numel())*4 bytes). The paper's Section IV-C constants (3.7 / 2e-3 /
+# 0.113) are kept in the comment for reference; the measured values replace
+# them so the Pareto communication axis is exact for THIS configuration.
+MODEL_SIZE_MB = 3.6331            # |θ| full LSTM, 952,385 params (paper: 3.7)
+MODEL_SHARED_SIZE_MB = 1.26e-4    # |gr(θ)| decode_fc2 head, 33 params (paper: 2e-3)
+GENERATOR_SIZE_MB = 0.0972        # |ω| generator, 25,472 params (paper: 0.113)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -502,7 +505,8 @@ def comm_cost_fedavg(n_rounds, n_users_per_round, model_size_mb=MODEL_SIZE_MB):
 def comm_cost_fedavg_partial(n_rounds, n_users_per_round,
                              shared_size_mb=MODEL_SHARED_SIZE_MB):
     """FedAvg with partial sharing: only the shared head (decode_fc2) is exchanged.
-    C = 2|gr(θ)| * Σ|St|.  NOTE: |gr(θ)|≈2e-3 MB vs full |θ|=3.7 MB (~1850x smaller)."""
+    C = 2|gr(θ)| * Σ|St|.  Measured: |gr(θ)|=1.26e-4 MB vs full |θ|=3.6331 MB
+    (~28,800x smaller; the paper's 2e-3 constant implied ~1850x)."""
     return 2 * shared_size_mb * n_rounds * n_users_per_round
 
 

@@ -54,6 +54,60 @@ def _client_test_sizes(data_case, alpha):
     return sizes
 ARTIFACT_FLAG = {'fedgen_gmm', 'fedgen_gmm_full'}   # pooled win is a separation artifact
 
+# ── corrected communication accounting (recomputed, NOT retrained) ───────────
+# The run loops omitted client->server uploads: per-class latent prototypes
+# (2 classes x (mean+std) x latent_dim floats) for anchor-using variants, and
+# the GMM client-distribution upload. final_mb is recomputed analytically as
+# n_rounds x corrected bytes/round. The OLD formula is replicated first and
+# validated against the saved cumul_mb[-1] (must match <0.1%) before applying
+# the correction; on any mismatch the saved value is kept. The uncorrected
+# value is preserved in final_mb_saved.
+N_CLIENTS_MB  = 5
+NUM_CLASSES_MB = 2
+
+
+def _arch_counts():
+    hp  = json.load(open(os.path.join(BASE, 'federated_data', 'fl_hyperparams.json')))
+    inp = len(json.load(open(os.path.join(BASE, 'federated_data', 'feature_schema.json'))))
+    hid = hp['hidden_dim']
+    fe  = ((inp * hid + hid) + 2 * hid
+           + (hid * (hid // 2) + hid // 2) + 2 * (hid // 2)
+           + ((hid // 2) * (hid // 4) + hid // 4) + 2 * (hid // 4))
+    n_pred = (hid // 4) * 2 + 2
+    lat    = hid // 4
+    n_gen  = NUM_CLASSES_MB * 4 + (4 + 16) * 32 + 32 + 32 * lat + lat
+    return fe + n_pred, n_pred, n_gen, lat
+
+
+try:
+    _ARCH = _arch_counts()
+except Exception:
+    _ARCH = None
+
+
+def _bytes_per_round(variant):
+    """Returns (old_bytes, corrected_bytes) per round for one variant."""
+    n_full, n_pred, n_gen, lat = _ARCH
+    N     = N_CLIENTS_MB
+    proto = 2 * 2 * lat * 4        # prototype upload per client
+    lc    = NUM_CLASSES_MB * 4     # label-count upload per client (pyhat/paper/zhu_code)
+    gmmb  = 2 * 2 * lat * 4        # GMM params, one direction, per client
+    if variant == 'fedavg_full':
+        old = 2 * n_full * 4 * N;                return old, old
+    if variant == 'fedavg_partial':
+        old = 2 * n_pred * 4 * N;                return old, old
+    if variant == 'fedgen_gmm':
+        old = 2 * n_pred * 4 * N + gmmb * N;     return old, old + gmmb * N
+    if variant == 'fedgen_gmm_full':
+        old = 2 * n_full * 4 * N + gmmb * N;     return old, old + gmmb * N
+    base  = (2 * (n_full if 'full' in variant else n_pred) + n_gen) * 4 * N
+    pyhat = any(k in variant for k in ('pyhat', 'paper', 'zhu_code'))
+    old   = base + (lc * N if pyhat else 0)
+    # variants whose server generator loss never reads the anchor send no prototypes
+    no_anchor = ('no_proto' in variant
+                 or ('zhu_code' in variant and 'medoid' not in variant))
+    return old, old + (0 if no_anchor else proto * N)
+
 # curated variants for the headline figures (others still go to the CSV)
 HEADLINE = ['fedavg_full', 'fedavg_partial', 'fedgen_full', 'fedgen_partial',
             'fedgen_zhu', 'fedgen_zhu_full', 'fedgen_paper_partial', 'fedgen_paper_full',
@@ -136,7 +190,17 @@ def build_dataframe(data_cases=('filtered', 'unfiltered')):
         pw_m, pw_s = _agg([r['perclient_worst'] for r in rs])
         sizes = _client_test_sizes(dc, a)
         pcw_m, _ = _agg([_weighted_perclient(r['pc_dict'], sizes) for r in rs])  # size-weighted
-        mb_m, _ = _agg([r['final_mb'] for r in rs])
+        mb_saved, _ = _agg([r['final_mb'] for r in rs])
+        mb_m = mb_saved
+        if _ARCH is not None:
+            old_b, new_b = _bytes_per_round(v)
+            replicates = all(
+                r['final_mb'] is not None and
+                abs(r['n_rounds'] * old_b / 2 ** 20 - r['final_mb'])
+                < 1e-3 * max(r['final_mb'], 1.0)
+                for r in rs)
+            if replicates:
+                mb_m = sum(r['n_rounds'] * new_b / 2 ** 20 for r in rs) / len(rs)
         rounds = np.mean([r['n_rounds'] for r in rs]) if rs else float('nan')
         all_pc = [x for r in rs for x in r['pc_values']]
         client_sigma = float(np.std(all_pc)) if all_pc else float('nan')
@@ -147,6 +211,7 @@ def build_dataframe(data_cases=('filtered', 'unfiltered')):
             test_auc_mean=round(sp_m, 4), test_auc_std=round(sp_s, 4),
             client_sigma=round(client_sigma, 4),
             rounds=round(rounds, 1), final_mb=round(mb_m, 3),
+            final_mb_saved=round(mb_saved, 3),   # pre-correction value (run-loop formula)
             # ── CLIENT-LOCAL metrics (the UC2-equivalent view) ──
             perclient_wmean=round(pcw_m, 4),     # size-weighted  (matches UC2 aggregation)
             perclient_mean=round(pc_m, 4), perclient_std=round(pc_s, 4),   # equal-weight macro

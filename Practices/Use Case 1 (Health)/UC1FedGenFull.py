@@ -504,7 +504,9 @@ def _run_fedgen_full_generic(clients, input_dim, seed,
 
     n_full      = sum(p.numel() for p in global_model.parameters())
     n_gen       = sum(p.numel() for p in generator_.parameters())
-    bytes_round = (2 * n_full + n_gen) * 4 * n_clients
+    # client->server prototype upload: 2 classes x (mean+std) x latent_dim floats
+    proto_bytes = 2 * 2 * latent_dim * 4 if lambda_proto > 0 else 0
+    bytes_round = (2 * n_full + n_gen) * 4 * n_clients + proto_bytes * n_clients
 
     best_val_auc, best_state, best_gen_state, no_improve = 0.0, None, None, 0
     history, cumul_mb, total_bytes = [], [], 0
@@ -596,7 +598,9 @@ def _run_fedgen_full_pyhat_generic(clients, input_dim, seed,
 
     n_full      = sum(p.numel() for p in global_model.parameters())
     n_gen       = sum(p.numel() for p in generator_.parameters())
-    bytes_round = (2 * n_full + n_gen) * 4 * n_clients + NUM_CLASSES * 4 * n_clients
+    proto_bytes = 2 * 2 * latent_dim * 4 if lambda_proto > 0 else 0
+    bytes_round = ((2 * n_full + n_gen) * 4 * n_clients
+                   + NUM_CLASSES * 4 * n_clients + proto_bytes * n_clients)
 
     best_val_auc, best_state, best_gen_state, no_improve = 0.0, None, None, 0
     history, cumul_mb, total_bytes = [], [], 0
@@ -841,8 +845,10 @@ def run_fedgen_gmm_full(clients, input_dim, seed, hidden_dim, dropout, lr, batch
     global_model = MLP(input_dim, hidden_dim=hidden_dim, dropout=dropout).to(device)
     gmm          = GMMSampler(latent_dim, device)
 
+    # gmm.param_bytes() counted twice: download of global Gaussians + upload of
+    # the per-client latent distributions
     n_full      = sum(p.numel() for p in global_model.parameters())
-    bytes_round = 2 * n_full * 4 * n_clients + gmm.param_bytes() * n_clients
+    bytes_round = 2 * n_full * 4 * n_clients + 2 * gmm.param_bytes() * n_clients
 
     best_val_auc, best_state, no_improve = 0.0, None, 0
     history, cumul_mb, total_bytes = [], [], 0
@@ -928,6 +934,7 @@ def run_fedgen_zhu_code_full(clients, input_dim, seed, hidden_dim, dropout, lr, 
 
     n_full      = sum(p.numel() for p in global_model.parameters())
     n_gen       = sum(p.numel() for p in generator_.parameters())
+    # no prototype upload: update_generator_zhu_code_full has no anchor term
     bytes_round = (2 * n_full + n_gen) * 4 * n_clients + NUM_CLASSES * 4 * n_clients
 
     best_val_auc, best_state, best_gen_state, no_improve = 0.0, None, None, 0
@@ -1056,7 +1063,10 @@ def run_fedgen_zhu_code_full_medoid(clients, input_dim, seed, hidden_dim, dropou
 
     n_full      = sum(p.numel() for p in global_model.parameters())
     n_gen       = sum(p.numel() for p in generator_.parameters())
-    bytes_round = (2 * n_full + n_gen) * 4 * n_clients + NUM_CLASSES * 4 * n_clients
+    # medoid anchor used by update_generator_zhu_code_full_proto -> prototypes uploaded
+    proto_bytes = 2 * 2 * latent_dim * 4
+    bytes_round = ((2 * n_full + n_gen) * 4 * n_clients
+                   + NUM_CLASSES * 4 * n_clients + proto_bytes * n_clients)
 
     best_val_auc, best_state, best_gen_state, no_improve = 0.0, None, None, 0
     history, cumul_mb, total_bytes = [], [], 0

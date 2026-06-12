@@ -530,7 +530,10 @@ def _run_fedgen_partial_generic(clients, input_dim, seed,
 
     n_pred      = sum(p.numel() for p in global_model.predictor.parameters())
     n_gen       = sum(p.numel() for p in generator_.parameters())
-    bytes_round = (2 * n_pred + n_gen) * 4 * n_clients
+    # client->server prototype upload: 2 classes x (mean+std) x latent_dim floats,
+    # only transmitted when the server's generator loss uses the anchor (lambda>0)
+    proto_bytes = 2 * 2 * latent_dim * 4 if lambda_proto > 0 else 0
+    bytes_round = (2 * n_pred + n_gen) * 4 * n_clients + proto_bytes * n_clients
 
     best_val_auc, best_gr_state, best_gen_state, no_improve = 0.0, None, None, 0
     history, cumul_mb, total_bytes = [], [], 0
@@ -626,7 +629,9 @@ def _run_fedgen_partial_pyhat_generic(clients, input_dim, seed,
 
     n_pred      = sum(p.numel() for p in global_model.predictor.parameters())
     n_gen       = sum(p.numel() for p in generator_.parameters())
-    bytes_round = (2 * n_pred + n_gen) * 4 * n_clients + NUM_CLASSES * 4 * n_clients
+    proto_bytes = 2 * 2 * latent_dim * 4 if lambda_proto > 0 else 0
+    bytes_round = ((2 * n_pred + n_gen) * 4 * n_clients
+                   + NUM_CLASSES * 4 * n_clients + proto_bytes * n_clients)
 
     best_val_auc, best_gr_state, best_gen_state, no_improve = 0.0, None, None, 0
     history, cumul_mb, total_bytes = [], [], 0
@@ -879,8 +884,10 @@ def run_fedgen_gmm(clients, input_dim, seed, hidden_dim, dropout, lr, batch_size
     for i in range(n_clients):
         local_models[i].load_state_dict(global_model.state_dict())
 
+    # gmm.param_bytes() counted twice: server->client download of the global
+    # per-class Gaussians AND client->server upload of the local distributions
     n_pred      = sum(p.numel() for p in global_model.predictor.parameters())
-    bytes_round = 2 * n_pred * 4 * n_clients + gmm.param_bytes() * n_clients
+    bytes_round = 2 * n_pred * 4 * n_clients + 2 * gmm.param_bytes() * n_clients
 
     best_val_auc, best_gr_state, no_improve = 0.0, None, 0
     history, cumul_mb, total_bytes = [], [], 0
@@ -978,6 +985,7 @@ def run_fedgen_zhu_code_partial(clients, input_dim, seed, hidden_dim, dropout, l
 
     n_pred      = sum(p.numel() for p in global_model.predictor.parameters())
     n_gen       = sum(p.numel() for p in generator_.parameters())
+    # no prototype upload: update_generator_zhu_code has no anchor term
     bytes_round = (2 * n_pred + n_gen) * 4 * n_clients + NUM_CLASSES * 4 * n_clients
 
     best_val_auc, best_gr_state, best_gen_state, no_improve = 0.0, None, None, 0
@@ -1119,7 +1127,10 @@ def run_fedgen_zhu_code_partial_medoid(clients, input_dim, seed, hidden_dim, dro
 
     n_pred      = sum(p.numel() for p in global_model.predictor.parameters())
     n_gen       = sum(p.numel() for p in generator_.parameters())
-    bytes_round = (2 * n_pred + n_gen) * 4 * n_clients + NUM_CLASSES * 4 * n_clients
+    # medoid anchor used by update_generator_zhu_code_proto -> prototypes uploaded
+    proto_bytes = 2 * 2 * latent_dim * 4
+    bytes_round = ((2 * n_pred + n_gen) * 4 * n_clients
+                   + NUM_CLASSES * 4 * n_clients + proto_bytes * n_clients)
 
     best_val_auc, best_gr_state, best_gen_state, no_improve = 0.0, None, None, 0
     history, cumul_mb, total_bytes = [], [], 0
