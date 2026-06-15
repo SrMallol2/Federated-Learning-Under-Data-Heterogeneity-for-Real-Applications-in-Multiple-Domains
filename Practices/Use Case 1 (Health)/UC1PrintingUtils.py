@@ -1626,3 +1626,7 @@ def print_equity_table(results, alpha_sweep, data_case='filtered'):
 def _save(path):
     os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
     plt.savefig(path, bbox_inches='tight')
+    # also emit a vector PDF (same basename) for LaTeX inclusion in the thesis appendix
+    root, ext = os.path.splitext(path)
+    if ext.lower() != '.pdf':
+        plt.savefig(root + '.pdf', bbox_inches='tight')

@@ -19,9 +19,16 @@ Column semantics:
   diverges     : true divergence — non-finite metrics or final MAE worse
                  than the round-0 init (does not fire on any current run)
 
+CLEAN-TEST UPDATE (post-audit): the per-user test sets above are window-split
+from the SAME APs/time range as training (~97% of test windows have a train
+window shifted by +-1 step) — treat them as VALIDATION. The headline numbers
+now come from the clean held-out-AP evaluation (uc2_clean_test.py +
+uc2_reeval.py -> uc2_clean_results*.csv), loaded here via clean_dataframe().
+
 Public API (importable from the notebook):
   PROTOCOLS                                  -> {'client_local': 'results/newpart', 'global': ...}
   build_dataframe()                          -> pandas.DataFrame (both protocols)
+  clean_dataframe()                          -> clean held-out-AP results (aggregated over reps)
   write_csv(path=None, df=None)              -> path written
   trajectory(protocol, method, alpha, rep=0) -> list[mse_per_round]
   le_sweep_dataframe()                       -> local-steps sweep (le = batch steps/round, K=1)
@@ -99,6 +106,22 @@ def write_csv(path=None, df=None):
     path = path or os.path.join(BASE, 'uc2_results.csv')
     df.to_csv(path, index=False)
     return path
+
+
+def clean_dataframe(aggregated=True):
+    """Clean held-out-AP results produced by uc2_reeval.py.
+
+    aggregated=True  -> uc2_clean_results_agg.csv (mean/std over reps)
+    aggregated=False -> uc2_clean_results.csv     (one row per rep)
+
+    These are evaluated on the 16 held-out test APs (zero window overlap with
+    training, train-scaler scaled, train-duplicate dead windows removed) using
+    the checkpoints selected on the old test set — which therefore acts as the
+    validation set. Old metrics are kept in the old_* columns for comparison.
+    """
+    import pandas as pd
+    name = 'uc2_clean_results_agg.csv' if aggregated else 'uc2_clean_results.csv'
+    return pd.read_csv(os.path.join(BASE, name))
 
 
 # ───────────────────── local-steps sweep (le = batch steps per round) ─────────

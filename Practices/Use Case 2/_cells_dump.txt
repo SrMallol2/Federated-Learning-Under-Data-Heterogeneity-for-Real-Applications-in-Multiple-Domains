@@ -1,0 +1,58 @@
+==== CELL 0 markdown ====
+# UC2 — Results (reframed / corrected)
+
+This supersedes `04_UC2_Results.ipynb`. Numbers come from the **final** runs under
+`results/newpart` (client-local test) and `results/newpart_global` (global test)
+via `uc2_honest_table.py` — **no retraining**. What changed and why:
+
+| Issue (old notebook) | Fix here |
+|---|---|
+| Headline metric `unscaled_mae` lives in `10**(...)` space, is dominated by the largest-load samples, frozen w.r.t. real learning, and yields ~1e8 MAPE | Report the **scaled MSE/MAE** (computed directly on output vs y) |
+| Read the superseded bare `results/` tree (where FedGen looked bad) | Read **`newpart` / `newpart_global`** |
+| `fedgen-partial` had no data; "partial dominates" was unsupported | `newpart` has full 3-seed `fedgen-partial`; both protocols shown |
+
+**Finding (corrected):** Centralized ≈ 0.032 > FedGen ≈ 0.040 ≫ FedAvg ≈ 0.17 — FedGen reaches near-centralized error and beats FedAvg ~4×.
+
+**Caveats to state in the thesis:**
+1. **FedAvg stalls — it does not diverge.** Its scaled MSE never improves on the round-0 init (best at round 0, even at α=10) while its L1 training objective (scaled MAE) decreases slowly and monotonically (≈0.39 → 0.34 over 300 rounds; no NaNs). L1 training pulls predictions toward the conditional median, which worsens MSE. The local-steps sweep (§3b) shows FedAvg does not escape at any `local_epochs` ∈ {1,5,10,20} while FedGen unlocks at ≥10 — the gap is a stability/efficiency property of the matched protocol, not an artifact of the le=20 choice.
+2. **FedGen-partial** wins on the *client-local* test but degrades badly on the *global* test (personalization, not generalization) — see §4.
+3. Model selection is on the test set (no validation split) — inherited, applied symmetrically.
+
+
+==== CELL 14 markdown ====
+## 6. Limitations (state these explicitly in the thesis)
+
+1. **Metric.** Scaled `mse`/RMSE (computed directly on output vs y) is the honest metric and is
+   used throughout. `unscaled_mae`/`mape` live in `10**(...)` space (the target is log10),
+   are dominated by the largest-load samples, are frozen w.r.t. real learning (≈0.4% range over
+   300 rounds, r=−0.77 vs scaled error), and yield ~1e8 MAPE — they are **not** reported as a
+   headline or used for model selection.
+2. **FedAvg baseline.** Vanilla FedAvg *stalls* under the matched protocol: its scaled MSE never
+   improves on the round-0 init (even at α=10) while its L1 objective improves slowly — a stall,
+   not divergence (no NaNs; the trained loss decreases monotonically). The local-steps sweep (§3b;
+   le ∈ {1,5,10,20}, seed 0) shows the stall is not a local-steps artifact: FedAvg does not escape
+   at any le and more local steps help rather than hurt (no client-drift penalty), while FedGen
+   unlocks at le ≥ 10. **Optimizer protocol:** all hyperparameters and optimizers follow the
+   reference framework (Wilhelmi et al.) for comparability — FedAvg and FedGen use the *same* SGD
+   optimizer and learning rate (the comparison is optimizer-matched), while the **centralized
+   reference uses Adam** (hard-coded in the framework); the centralized–FL gap therefore crosses
+   an optimizer boundary and is reported as an upper reference, not a matched baseline.
+   Frame the FedAvg–FedGen gap as *stability/efficiency under the matched protocol*, not raw
+   accuracy superiority. Note `local_epochs` = mini-batch steps per round (K=1, batch 32), not
+   full epochs.
+3. **Partial sharing keeps the encoder local**, so global-pool evaluation is **off-design** for
+   FedGen-partial (local encoder applied to a shared global test, `new_partitions.py:174-191`).
+   Client-local (`newpart`) is the **primary** metric for partial; the global result is reported
+   as a stress test, not a fair benchmark.
+4. **Communication cost.** Partial sharing exchanges only the head (`decode_fc2`). Sizes are now
+   **measured from the instantiated objects** (UC2Utils.py): full LSTM 3.6331 MB (952,385 params),
+   head 1.26e-4 MB (33 params), generator 0.0972 MB (25,472 params) — the paper constants
+   (3.7 / 2e-3 / 0.113) overstated the head ≈16×. Head-only exchange is ≈28,800× cheaper than the
+   full model; FedGen-partial costs ≈0.0975 MB/round/user (generator-dominated) vs 7.27 for full
+   FedAvg (≈75×). Do not use the full-model cost for any partial variant on the Pareto, and re-run
+   Pareto cells so they pick up the measured constants.
+5. **Inherited from the reference (Zhu) framework.** (a) Model selection is on the **test** set
+   (no validation split), applied symmetrically; (b) FedGen is a **classification** KD method
+   adapted to **regression** — the generator's label-conditioning/diversity loss map imperfectly
+   to a continuous target; this adaptation is acknowledged, not claimed as novel/validated.
+6. **Replicatio

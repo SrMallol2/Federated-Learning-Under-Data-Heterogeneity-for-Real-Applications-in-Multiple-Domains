@@ -18,7 +18,7 @@ class FedAvg(Server):
 
         for i in range(total_users):
             id, train_data, test_data = read_user_data(i, data, dataset=args.dataset, model=args.model)
-            user = UserAVG(args, id, model, train_data, test_data, use_adam=False)
+            user = UserAVG(args, id, model, train_data, test_data, use_adam=self.use_adam)
             self.users.append(user)
             self.total_train_samples += user.train_samples
 
